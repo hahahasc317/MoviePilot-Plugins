@@ -1,0 +1,15 @@
+{
+  "BitrateSelector": {
+    "name": "码率优选",
+    "description": "下载前按「种子体积 ÷ 每集时长」估算码率，同覆盖范围自动优选高码率候选；可选拦截低码率下载；支持洗版准入按估算码率优先。",
+    "labels": "下载管理",
+    "version": "1.1.0",
+    "author": "hahahasc317",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.1.0": "新增码率优先洗版：运行时接管洗版准入判定，按估算码率与每集基线决定是否升级",
+      "v1.0.0": "初始版本：ResourceSelection 同覆盖择优 + ResourceDownload 低码率拦截"
+    }
+  }
+}
