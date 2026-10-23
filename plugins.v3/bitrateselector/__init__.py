@@ -1,10 +1,16 @@
 import inspect
+import json
+import re
+import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.chain.tmdb import TmdbChain
 from app.application.subscription import priority as subscription_priority
+from app.db.oper.subscribe import SubscribeOper
 from app.plugins import _PluginBase
+from apscheduler.triggers.cron import CronTrigger
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.media import Context
@@ -16,6 +22,8 @@ from app.schemas.types import ChainEventType, MediaType
 RUNTIME_CACHE_TTL_SECONDS = 6 * 3600
 # 洗版码率基线在插件数据中的存储键
 WASH_BASELINES_KEY = "wash_baselines"
+# 洗版基线默认的媒体库根目录（STRM 库挂载点）
+DEFAULT_LIBRARY_ROOT = "/media"
 
 
 class BitrateSelector(_PluginBase):
@@ -30,10 +38,10 @@ class BitrateSelector(_PluginBase):
     plugin_name = "码率优选"
     plugin_desc = (
         "下载前按「种子体积 ÷ 每集时长」估算码率，同覆盖范围自动优选高码率资源；"
-        "可选拦截低于门槛的低码率下载；支持洗版准入按估算码率优先（码率优先洗版）。"
+        "可选拦截低码率下载；支持洗版准入按估算码率优先，并可从媒体库播种实测基线。"
     )
     plugin_icon = ""
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -46,6 +54,7 @@ class BitrateSelector(_PluginBase):
     _veto_min_mbps = 8.0
     _notify = True
     _wash_enabled = False
+    _library_root = DEFAULT_LIBRARY_ROOT
     _baselines: Dict[str, Dict[str, Any]] = {}
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
@@ -65,8 +74,16 @@ class BitrateSelector(_PluginBase):
             self._veto_min_mbps = 8.0
         self._notify = bool(config.get("notify"))
         self._wash_enabled = bool(config.get("wash_enabled"))
+        self._library_root = (
+            str(config.get("library_root") or DEFAULT_LIBRARY_ROOT).rstrip("/")
+            or DEFAULT_LIBRARY_ROOT
+        )
         self._baselines = self.get_data(WASH_BASELINES_KEY) or {}
         self._apply_wash_patch()
+        if self._wash_enabled:
+            threading.Thread(
+                target=self._safe_seed_baselines, name="bitrateselector-seed", daemon=True
+            ).start()
 
     def get_state(self) -> bool:
         """获取插件启用状态。"""
@@ -140,7 +157,7 @@ class BitrateSelector(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -156,7 +173,7 @@ class BitrateSelector(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -165,6 +182,22 @@ class BitrateSelector(_PluginBase):
                                             "label": "低码率拦截门槛(Mbps)",
                                             "type": "number",
                                             "hint": "估算码率低于此值时取消下载；可能导致缺集，慎用",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "library_root",
+                                            "label": "媒体库根目录",
+                                            "type": "text",
+                                            "hint": "STRM 媒体库挂载点，用于按实测码率播种洗版基线",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -191,7 +224,9 @@ class BitrateSelector(_PluginBase):
                                                 "「低码率拦截」作用于每个资源提交下载前，可能造成缺集，默认关闭。"
                                                 "「码率优先洗版」开启后，洗版准入改按估算码率与插件记录的每集基线比较"
                                                 "（需领先超过设定比例才升级），旧规则优先级基线不再参与洗版；"
-                                                "规则组仍负责资源资格筛选。"
+                                                "规则组仍负责资源资格筛选。开启后会扫描媒体库根目录下"
+                                                " P115StrmHelper 生成的 -mediainfo.json，为没有基线的剧集"
+                                                "播种实测码率，并每天 07:30 自动补充。"
                                             ),
                                         },
                                     }
@@ -209,6 +244,7 @@ class BitrateSelector(_PluginBase):
             "wash_enabled": False,
             "margin_percent": 15,
             "veto_min_mbps": 8.0,
+            "library_root": DEFAULT_LIBRARY_ROOT,
         }
         return form, defaults
 
@@ -233,6 +269,20 @@ class BitrateSelector(_PluginBase):
         self._remove_wash_patch()
         self._runtime_cache = {}
         self._tmdb_chain = None
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """注册每天 07:30 的库内基线播种服务。"""
+        if not (self._enabled and self._wash_enabled):
+            return []
+        return [
+            {
+                "id": "BitrateSelectorSeedBaselines",
+                "name": "码率基线库内播种",
+                "trigger": CronTrigger.from_crontab("30 7 * * *"),
+                "func": self._safe_seed_baselines,
+                "kwargs": {},
+            }
+        ]
 
     @eventmanager.register(ChainEventType.ResourceSelection)
     def select_high_bitrate(self, event: Event) -> None:
@@ -482,22 +532,193 @@ class BitrateSelector(_PluginBase):
         source, media_id = resolve_media_identity(media=ctx.media_info)
         key = self._wash_media_key(source=source, media_id=media_id, season=season)
         if not key:
+            logger.warning(
+                f"码率优选：下载事件缺少媒体身份（{ctx.media_info}），未记录码率基线"
+            )
             return
         bitrate = self._estimate_bitrate(ctx, episodes)
         if bitrate is None:
+            logger.warning(
+                f"码率优选：无法估算下载码率（{ctx.torrent_info.title}），未记录码率基线"
+            )
             return
-        entry = self._baselines.setdefault(key, {})
-        if episodes:
-            episode_map = entry.setdefault("episodes", {})
-            for episode in episodes:
-                episode_map[str(episode)] = round(bitrate, 2)
-        else:
-            entry["full"] = round(bitrate, 2)
-        self.save_data(WASH_BASELINES_KEY, self._baselines)
-        logger.debug(
+        try:
+            entry = self._baselines.setdefault(key, {})
+            if episodes:
+                episode_map = entry.setdefault("episodes", {})
+                for episode in episodes:
+                    episode_map[str(episode)] = round(bitrate, 2)
+            else:
+                entry["full"] = round(bitrate, 2)
+            self.save_data(WASH_BASELINES_KEY, self._baselines)
+        except Exception as err:
+            logger.error(f"码率优选：保存码率基线失败：{err}")
+            return
+        logger.info(
             f"码率优选：记录洗版码率基线 {key} "
             f"{sorted(episodes) if episodes else '全集'} => {bitrate:.2f}Mbps"
         )
+
+    def _safe_seed_baselines(self) -> Dict[str, Any]:
+        """执行库内播种并吞掉异常，返回结果摘要。"""
+        try:
+            return self.seed_baselines_from_library()
+        except Exception as err:
+            logger.error(f"码率优选：库内基线播种失败：{err}")
+            return {"success": False, "seeded": 0, "message": str(err)}
+
+    def seed_baselines_from_library(self) -> Dict[str, Any]:
+        """
+        扫描媒体库 mediainfo，为尚无基线的剧集填充实测码率。
+
+        只补空缺、不覆盖下载时记录的基线；已下载集以事件记录为准。
+        """
+        if not (self._enabled and self._wash_enabled):
+            return {"success": False, "seeded": 0, "message": "插件或码率优先洗版未启用"}
+        root = Path(self._library_root)
+        if not root.is_dir():
+            return {"success": False, "seeded": 0, "message": f"媒体库根目录不存在：{root}"}
+        subscriptions = [
+            subscribe
+            for subscribe in (SubscribeOper().list() or [])
+            if getattr(subscribe, "best_version", False)
+            and getattr(subscribe, "type", None) == MediaType.TV.value
+            and getattr(subscribe, "media_source", None)
+            and getattr(subscribe, "media_id", None)
+        ]
+        if not subscriptions:
+            return {"success": True, "seeded": 0, "message": "没有需要播种的洗版订阅"}
+        changed = 0
+        matched = 0
+        for subscribe in subscriptions:
+            seeded = self._seed_subscription_baseline(subscribe, root)
+            if seeded < 0:
+                continue
+            matched += 1
+            changed += seeded
+        if changed:
+            self.save_data(WASH_BASELINES_KEY, self._baselines)
+        logger.info(
+            f"码率优选：库内基线播种完成，补种 {changed} 集（匹配 {matched}/{len(subscriptions)} 个订阅）"
+        )
+        return {
+            "success": True,
+            "seeded": changed,
+            "matched_subscriptions": matched,
+            "total_subscriptions": len(subscriptions),
+        }
+
+    def _seed_subscription_baseline(self, subscribe: Any, root: Path) -> int:
+        """
+        为单个洗版订阅按库内 mediainfo 播种缺失的每集基线。
+
+        :return: 补种集数；库内未找到对应目录时返回 -1
+        """
+        name = str(getattr(subscribe, "name", "") or "")
+        year = getattr(subscribe, "year", None)
+        season = getattr(subscribe, "season", None) or 1
+        show_dir = self._find_show_dir(root, name, year)
+        if show_dir is None:
+            return -1
+        season_dir = self._find_season_dir(show_dir, season)
+        if season_dir is None:
+            return -1
+        key = self._wash_media_key(
+            source=getattr(subscribe, "media_source", None),
+            media_id=getattr(subscribe, "media_id", None),
+            season=season,
+        )
+        if not key:
+            return -1
+        entry = self._baselines.setdefault(key, {})
+        episode_map = entry.setdefault("episodes", {})
+        seeded = 0
+        for info_path in sorted(season_dir.glob("*-mediainfo.json")):
+            episode_number = self._episode_from_filename(info_path.name)
+            if not episode_number:
+                continue
+            if episode_map.get(str(episode_number)) is not None:
+                continue
+            bitrate = self._mediainfo_bitrate_mbps(info_path)
+            if bitrate is None:
+                continue
+            episode_map[str(episode_number)] = bitrate
+            seeded += 1
+        if seeded:
+            logger.info(
+                f"码率优选：库内播种 {key} 补种 {seeded} 集实测基线（{show_dir.name}）"
+            )
+        return seeded
+
+    def _find_show_dir(self, root: Path, name: str, year: Any) -> Optional[Path]:
+        """在媒体库根目录有限深度内按「剧名 (年份)」匹配剧集目录。"""
+        if not name:
+            return None
+        year_token = f"({year})" if year not in (None, "") else None
+        for show_dir in self._iter_show_dirs(root, depth=3):
+            if year_token and year_token not in show_dir.name:
+                continue
+            if name in show_dir.name:
+                return show_dir
+        return None
+
+    @staticmethod
+    def _iter_show_dirs(root: Path, depth: int = 3):
+        """逐层遍历根目录下有限深度的子目录，避免整库递归扫描。"""
+        current = [root]
+        for _ in range(depth):
+            next_level: List[Path] = []
+            for directory in current:
+                try:
+                    children = [child for child in directory.iterdir() if child.is_dir()]
+                except OSError:
+                    continue
+                for child in children:
+                    yield child
+                    next_level.append(child)
+            current = next_level
+
+    @staticmethod
+    def _find_season_dir(show_dir: Path, season: int) -> Optional[Path]:
+        """在剧集目录内定位指定季的目录，兼容 Season 1 与 Season 01。"""
+        for child in show_dir.iterdir():
+            if not child.is_dir() or not child.name.lower().startswith("season"):
+                continue
+            parts = child.name.split()
+            if parts and parts[-1].isdigit() and int(parts[-1]) == int(season):
+                return child
+        return None
+
+    @staticmethod
+    def _episode_from_filename(filename: str) -> Optional[int]:
+        """从 mediainfo 文件名中解析集号。"""
+        matched = re.search(r"S\d+E(\d+)", filename, re.IGNORECASE)
+        if not matched:
+            return None
+        try:
+            return int(matched.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _mediainfo_bitrate_mbps(self, path: Path) -> Optional[float]:
+        """读取 P115StrmHelper mediainfo 中视频流的实测码率（Mbps）。"""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            source = data[0]["MediaSourceInfo"]
+            video = next(
+                stream
+                for stream in source.get("MediaStreams", [])
+                if stream.get("Type") == "Video"
+            )
+            bitrate = int(video.get("BitRate") or 0)
+            if not bitrate:
+                size = int(source.get("Size") or 0)
+                ticks = float(source.get("RunTimeTicks") or 0)
+                if size and ticks:
+                    bitrate = int(size * 8 / (ticks / 10_000_000))
+            return round(bitrate / 1_000_000, 2) if bitrate else None
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            return None
 
     def _drop_dominated_candidates(
         self, contexts: List[Any]
