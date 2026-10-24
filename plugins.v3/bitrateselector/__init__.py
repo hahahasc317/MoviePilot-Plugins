@@ -41,7 +41,7 @@ class BitrateSelector(_PluginBase):
         "可选拦截低码率下载；支持洗版准入按估算码率优先，并可从媒体库播种实测基线。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -407,7 +407,8 @@ class BitrateSelector(_PluginBase):
         按估算码率执行洗版准入判定。
 
         全集模式对比整季基线；分集模式按每集基线计算仍可提升的剧集范围。
-        无法估算码率时回退原始规则优先级判定。
+        无法估算码率时回退原始规则优先级判定；基线缺失时保守处理：
+        全集模式回退原始判定，分集模式跳过缺基线的集，防止低码候选盲目洗版。
         """
         if getattr(subscribe, "type", None) != MediaType.TV.value or original is None:
             return original(subscribe, context, priority)
@@ -418,7 +419,10 @@ class BitrateSelector(_PluginBase):
                 return original(subscribe, context, priority)
             baseline = self._wash_baseline_entry(subscribe).get("full")
             if baseline is None:
-                return True
+                logger.info(
+                    "码率优选：全集洗版基线缺失，回退规则优先级判定，防止低码候选盲目洗版"
+                )
+                return original(subscribe, context, priority)
             if candidate_mbps > float(baseline) * (1 + margin):
                 logger.info(
                     f"码率优选：全集洗版准入 {candidate_mbps:.1f}Mbps 超过基线 "
@@ -445,6 +449,7 @@ class BitrateSelector(_PluginBase):
         按码率基线计算仍值得洗版的剧集。
 
         返回 None 表示候选无法估算码率，需回退原始判定。
+        无基线记录的集不参与码率优先洗版，待库内播种补齐基线后再比较。
         """
         target_episodes = set(subscription_priority.get_best_version_target_episodes(subscribe))
         if not target_episodes:
@@ -462,14 +467,24 @@ class BitrateSelector(_PluginBase):
         threshold = candidate_mbps / (1 + margin)
         title = (getattr(context.torrent_info, "title", "") or "")[:60]
         if not selected_episodes:
+            missing = [
+                episode
+                for episode in target_episodes
+                if episode_baselines.get(str(episode)) is None
+            ]
+            if missing:
+                logger.debug(
+                    f"码率优选：{len(missing)} 集无码率基线，本轮不参与码率优先洗版"
+                )
             interested = sorted(
                 episode
                 for episode in target_episodes
-                if (baseline := episode_baselines.get(str(episode))) is None
-                or float(baseline) < threshold
+                if (baseline := episode_baselines.get(str(episode))) is not None
+                and float(baseline) < threshold
             )
         else:
             interested = []
+            missing = 0
             for episode in selected_episodes:
                 try:
                     episode_num = int(episode)
@@ -478,8 +493,15 @@ class BitrateSelector(_PluginBase):
                 if episode_num not in target_episodes:
                     continue
                 baseline = episode_baselines.get(str(episode_num))
-                if baseline is None or float(baseline) < threshold:
+                if baseline is None:
+                    missing += 1
+                    continue
+                if float(baseline) < threshold:
                     interested.append(episode_num)
+            if missing:
+                logger.debug(
+                    f"码率优选：{missing} 集无码率基线，本轮不参与码率优先洗版"
+                )
             interested = sorted(set(interested))
         if interested:
             episode_range = (
