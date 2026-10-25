@@ -31,6 +31,8 @@ class BitrateSelector(_PluginBase):
     码率优选：在下载执行前对比候选资源对每集的估算码率，自动保留高码率资源。
 
     码率估算公式：种子体积 × 8 ÷ (覆盖集时长之和 × 60)，单位 Mbps。
+    单集时长按「TMDB → 库内 mediainfo 实测 → 同季中位数」三级回退解析，
+    综艺等 TMDB 缺时长的剧集不再被排除在估算之外。
     对同一媒体、同一覆盖类别的候选，淘汰被更高码率候选覆盖的低码率候选；
     未标注集数的整季包按全季时长估算后同类比较。
     """
@@ -41,7 +43,7 @@ class BitrateSelector(_PluginBase):
         "可选拦截低码率下载；支持洗版准入按估算码率优先，并可从媒体库播种实测基线。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -218,12 +220,14 @@ class BitrateSelector(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "码率=种子体积×8÷每集时长之和。批量下载前，同一媒体内"
+                                                "码率=种子体积×8÷每集时长之和。单集时长按「TMDB→库内实测→同季中位」"
+                                                "三级回退解析，综艺缺 TMDB 时长也可估算。批量下载前，同一媒体内"
                                                 "集数覆盖相同（或被超集覆盖）且码率领先超过设定比例的低码率候选会被淘汰；"
                                                 "整季包按全季时长估算后同类比较。无法估算（缺集数/缺时长/非TMDB）的候选不参与淘汰。"
                                                 "「低码率拦截」作用于每个资源提交下载前，可能造成缺集，默认关闭。"
                                                 "「码率优先洗版」开启后，洗版准入改按估算码率与插件记录的每集基线比较"
                                                 "（需领先超过设定比例才升级），旧规则优先级基线不再参与洗版；"
+                                                "候选与基线的时长来源不一致（如一方含中位数填充）时阈值自动加倍；"
                                                 "规则组仍负责资源资格筛选。开启后会扫描媒体库根目录下"
                                                 " P115StrmHelper 生成的 -mediainfo.json，为没有基线的剧集"
                                                 "播种实测码率，并每天 07:30 自动补充。"
@@ -409,24 +413,30 @@ class BitrateSelector(_PluginBase):
         全集模式对比整季基线；分集模式按每集基线计算仍可提升的剧集范围。
         无法估算码率时回退原始规则优先级判定；基线缺失时保守处理：
         全集模式回退原始判定，分集模式跳过缺基线的集，防止低码候选盲目洗版。
+        候选与基线的时长来源不一致时（如基线为逐集实测、候选含中位数填充），
+        准入阈值加倍，防止时长误差穿越边界。
         """
         if getattr(subscribe, "type", None) != MediaType.TV.value or original is None:
             return original(subscribe, context, priority)
         margin = max(0, int(self._margin_percent)) / 100.0
         if subscription_priority.is_full_best_version_enabled(subscribe):
-            candidate_mbps = self._estimate_bitrate(context, set())
+            candidate_mbps, candidate_source = self._estimate_bitrate_ex(context, set())
             if candidate_mbps is None:
                 return original(subscribe, context, priority)
-            baseline = self._wash_baseline_entry(subscribe).get("full")
+            baseline_entry = self._wash_baseline_entry(subscribe)
+            baseline = baseline_entry.get("full")
             if baseline is None:
                 logger.info(
                     "码率优选：全集洗版基线缺失，回退规则优先级判定，防止低码候选盲目洗版"
                 )
                 return original(subscribe, context, priority)
-            if candidate_mbps > float(baseline) * (1 + margin):
+            baseline_source = str(baseline_entry.get("full_source") or "measured")
+            effective_margin = margin * 2 if candidate_source != baseline_source else margin
+            if candidate_mbps > float(baseline) * (1 + effective_margin):
                 logger.info(
                     f"码率优选：全集洗版准入 {candidate_mbps:.1f}Mbps 超过基线 "
-                    f"{float(baseline):.1f}Mbps（需 +{margin:.0%}）"
+                    f"{float(baseline):.1f}Mbps（需 +{effective_margin:.0%}，"
+                    f"时长来源 候选={candidate_source}/基线={baseline_source}）"
                 )
                 return True
             logger.debug(
@@ -458,13 +468,19 @@ class BitrateSelector(_PluginBase):
         selected_episodes = getattr(context, "selected_episodes", None)
         if selected_episodes is None:
             selected_episodes = meta.episode_list if meta else []
-        candidate_mbps = self._estimate_bitrate(
+        candidate_mbps, candidate_source = self._estimate_bitrate_ex(
             context, set(selected_episodes) if selected_episodes else set()
         )
         if candidate_mbps is None:
             return None
         episode_baselines = self._wash_baseline_entry(subscribe).get("episodes") or {}
-        threshold = candidate_mbps / (1 + margin)
+        baseline_sources = self._wash_baseline_entry(subscribe).get("ep_sources") or {}
+
+        def _threshold_for(baseline_source: str) -> float:
+            """按候选与基线的时长来源是否一致计算该集的比较阈值。"""
+            effective = margin * 2 if candidate_source != baseline_source else margin
+            return candidate_mbps / (1 + effective)
+
         title = (getattr(context.torrent_info, "title", "") or "")[:60]
         if not selected_episodes:
             missing = [
@@ -480,7 +496,8 @@ class BitrateSelector(_PluginBase):
                 episode
                 for episode in target_episodes
                 if (baseline := episode_baselines.get(str(episode))) is not None
-                and float(baseline) < threshold
+                and float(baseline)
+                < _threshold_for(str(baseline_sources.get(str(episode), "measured")))
             )
         else:
             interested = []
@@ -496,7 +513,9 @@ class BitrateSelector(_PluginBase):
                 if baseline is None:
                     missing += 1
                     continue
-                if float(baseline) < threshold:
+                if float(baseline) < _threshold_for(
+                    str(baseline_sources.get(str(episode_num), "measured"))
+                ):
                     interested.append(episode_num)
             if missing:
                 logger.debug(
@@ -558,7 +577,7 @@ class BitrateSelector(_PluginBase):
                 f"码率优选：下载事件缺少媒体身份（{ctx.media_info}），未记录码率基线"
             )
             return
-        bitrate = self._estimate_bitrate(ctx, episodes)
+        bitrate, duration_source = self._estimate_bitrate_ex(ctx, episodes)
         if bitrate is None:
             logger.warning(
                 f"码率优选：无法估算下载码率（{ctx.torrent_info.title}），未记录码率基线"
@@ -568,10 +587,13 @@ class BitrateSelector(_PluginBase):
             entry = self._baselines.setdefault(key, {})
             if episodes:
                 episode_map = entry.setdefault("episodes", {})
+                source_map = entry.setdefault("ep_sources", {})
                 for episode in episodes:
                     episode_map[str(episode)] = round(bitrate, 2)
+                    source_map[str(episode)] = duration_source
             else:
                 entry["full"] = round(bitrate, 2)
+                entry["full_source"] = duration_source
             self.save_data(WASH_BASELINES_KEY, self._baselines)
         except Exception as err:
             logger.error(f"码率优选：保存码率基线失败：{err}")
@@ -579,6 +601,7 @@ class BitrateSelector(_PluginBase):
         logger.info(
             f"码率优选：记录洗版码率基线 {key} "
             f"{sorted(episodes) if episodes else '全集'} => {bitrate:.2f}Mbps"
+            f"（时长来源={duration_source}）"
         )
 
     def _safe_seed_baselines(self) -> Dict[str, Any]:
@@ -800,22 +823,125 @@ class BitrateSelector(_PluginBase):
 
         无集数标注的整季包按全季已标注时长之和估算；无法估算时返回 None。
         """
+        mbps, _ = self._estimate_bitrate_ex(ctx, episodes)
+        return mbps
+
+    def _estimate_bitrate_ex(
+        self, ctx: Context, episodes: Set[int]
+    ) -> Tuple[Optional[float], str]:
+        """
+        估算候选资源对覆盖剧集的平均码率，并返回时长来源标签。
+
+        :return: (Mbps, 时长来源)；来源为 measured（逐集实测）或 estimated
+                 （含同季中位数填充），无法估算时返回 (None, "")。
+        """
         torrent = ctx.torrent_info
         media = ctx.media_info
         if not torrent or not torrent.size or not media:
-            return None
+            return None, ""
         meta = ctx.meta_info
         season = (meta.begin_season or 1) if meta else 1
-        runtimes = self._episode_runtimes(media, season)
-        if not runtimes:
-            return None
-        if episodes:
-            total_minutes = sum(runtimes.get(ep, 0) for ep in episodes)
-        else:
-            total_minutes = sum(runtimes.values())
+        minutes_map, source = self._resolve_episode_minutes(media, season, episodes)
+        if not minutes_map:
+            return None, ""
+        total_minutes = sum(minutes_map.values())
         if total_minutes <= 0:
+            return None, ""
+        return torrent.size * 8 / (total_minutes * 60) / 1_000_000, source
+
+    def _resolve_episode_minutes(
+        self, media: Any, season: int, episodes: Set[int]
+    ) -> Tuple[Optional[Dict[int, int]], str]:
+        """
+        三级回退解析覆盖剧集的单集时长（分钟）。
+
+        时长来源依次为：TMDB 单集 runtime、库内 mediainfo 实测时长、
+        同季已知时长的中位数填充。
+
+        :param episodes: 候选覆盖的集数；空集表示整季包，取全部已知集。
+        :return: (每集分钟数映射, 来源标签)；标签为 measured 或 estimated，
+                 完全无任何时长信息时返回 (None, "")。
+        """
+        tmdb = self._episode_runtimes(media, season)
+        library = self._library_episode_minutes(media, season)
+        if episodes:
+            targets = set(episodes)
+        else:
+            targets = set(tmdb) | set(library)
+        if not targets:
+            return None, ""
+        merged: Dict[int, int] = {}
+        for episode in sorted(targets):
+            minutes = tmdb.get(episode) or library.get(episode) or 0
+            if minutes > 0:
+                merged[episode] = int(minutes)
+        if len(merged) >= len(targets):
+            return (merged, "measured") if merged else (None, "")
+        # 覆盖集有缺失时，用同季已知时长（TMDB ∪ 库内实测）的中位数填充
+        known = sorted(set(tmdb.values()) | set(library.values()))
+        median = self._median_int(known)
+        if median <= 0:
+            # 无任何中位可填：保持旧行为，按已解析的部分时长估算
+            return (merged, "measured") if merged else (None, "")
+        for episode in targets - set(merged):
+            merged[episode] = median
+        return merged, "estimated"
+
+    def _library_episode_minutes(self, media: Any, season: int) -> Dict[int, int]:
+        """读取库内同季 mediainfo sidecar 的单集实测时长（分钟），缓存 6 小时。"""
+        cache = getattr(self, "_libdur_cache", None)
+        if cache is None:
+            cache = {}
+            self._libdur_cache = cache
+        title = str(getattr(media, "title", "") or "")
+        year = getattr(media, "year", None)
+        cache_key = (title, str(year or ""), int(season))
+        cached = cache.get(cache_key)
+        if cached and time.time() - cached[0] < RUNTIME_CACHE_TTL_SECONDS:
+            return cached[1]
+        minutes: Dict[int, int] = {}
+        try:
+            root = Path(self._library_root)
+            show_dir = self._find_show_dir(root, title, year) if title else None
+            season_dir = self._find_season_dir(show_dir, season) if show_dir else None
+            if season_dir is not None:
+                for info_path in season_dir.glob("*-mediainfo.json"):
+                    episode = self._episode_from_filename(info_path.name)
+                    if not episode:
+                        continue
+                    episode_minutes = self._mediainfo_runtime_minutes(info_path)
+                    if episode_minutes and episode_minutes > 0:
+                        minutes[episode] = int(episode_minutes)
+        except Exception as err:
+            logger.warning(f"码率优选：读取库内单集时长失败：{err}")
+            return {}
+        if minutes:
+            cache[cache_key] = (time.time(), minutes)
+        return minutes
+
+    @staticmethod
+    def _mediainfo_runtime_minutes(path: Path) -> Optional[int]:
+        """读取 mediainfo sidecar 的 RunTimeTicks 并换算为分钟。"""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            source = data[0]["MediaSourceInfo"]
+            ticks = float(source.get("RunTimeTicks") or 0)
+            if ticks <= 0:
+                return None
+            return int(ticks / 10_000_000 / 60)
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
             return None
-        return torrent.size * 8 / (total_minutes * 60) / 1_000_000
+
+    @staticmethod
+    def _median_int(values: List[int]) -> int:
+        """取正整数中位数（偶数个时取中间两数均值）。"""
+        ordered = sorted(v for v in values if v and v > 0)
+        if not ordered:
+            return 0
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return int(ordered[middle])
+        return int((ordered[middle - 1] + ordered[middle]) / 2)
 
     def _episode_runtimes(
         self, media: Any, season: int
