@@ -43,7 +43,7 @@ class BitrateSelector(_PluginBase):
         "可选拦截低码率下载；支持洗版准入按估算码率优先，并可从媒体库播种实测基线。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -413,6 +413,8 @@ class BitrateSelector(_PluginBase):
         全集模式对比整季基线；分集模式按每集基线计算仍可提升的剧集范围。
         无法估算码率时回退原始规则优先级判定；基线缺失时保守处理：
         全集模式回退原始判定，分集模式跳过缺基线的集，防止低码候选盲目洗版。
+        分集模式订阅整体无基线（库内尚无已入库集）时同样回退原始判定，
+        让新订阅正常完成初始下载。
         候选与基线的时长来源不一致时（如基线为逐集实测、候选含中位数填充），
         准入阈值加倍，防止时长误差穿越边界。
         """
@@ -459,7 +461,10 @@ class BitrateSelector(_PluginBase):
         按码率基线计算仍值得洗版的剧集。
 
         返回 None 表示候选无法估算码率，需回退原始判定。
-        无基线记录的集不参与码率优先洗版，待库内播种补齐基线后再比较。
+        订阅无任何分集基线（库内尚无已入库集）时同样返回 None，
+        交回核心初始下载判定，避免 0 库存新订阅被准入死锁。
+        已有部分基线时，无基线记录的集不参与码率优先洗版，
+        待库内播种补齐基线后再比较。
         """
         target_episodes = set(subscription_priority.get_best_version_target_episodes(subscribe))
         if not target_episodes:
@@ -475,6 +480,12 @@ class BitrateSelector(_PluginBase):
             return None
         episode_baselines = self._wash_baseline_entry(subscribe).get("episodes") or {}
         baseline_sources = self._wash_baseline_entry(subscribe).get("ep_sources") or {}
+        if not episode_baselines:
+            logger.info(
+                "码率优选：订阅尚无任何已入库集码率基线，"
+                "回退核心判定放行初始下载，防止 0 库存订阅死锁"
+            )
+            return None
 
         def _threshold_for(baseline_source: str) -> float:
             """按候选与基线的时长来源是否一致计算该集的比较阈值。"""
