@@ -43,7 +43,7 @@ class BitrateSelector(_PluginBase):
         "可选拦截低码率下载；支持洗版准入按估算码率优先，并可从媒体库播种实测基线。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -297,21 +297,23 @@ class BitrateSelector(_PluginBase):
         if not isinstance(data, ResourceSelectionEventData) or not data.contexts:
             return
         try:
-            kept, dropped = self._drop_dominated_candidates(list(data.contexts))
+            kept, dropped_logs, dropped_notices = self._drop_dominated_candidates(
+                list(data.contexts)
+            )
         except Exception as err:
             logger.error(f"码率优选：处理候选列表失败：{err}")
             return
-        if not dropped:
+        if not dropped_logs:
             return
         data.updated = True
         data.updated_contexts = kept
         data.source = "码率优选"
-        logger.info(f"码率优选：淘汰 {len(dropped)} 个低码率候选。{'；'.join(dropped)}")
+        logger.info(f"码率优选：淘汰 {len(dropped_logs)} 个低码率候选。{'；'.join(dropped_logs)}")
         if self._notify:
             self.post_message(
                 mtype=None,
                 title="码率优选",
-                text=f"已淘汰 {len(dropped)} 个低码率候选：\n" + "\n".join(dropped[:5]),
+                text="同覆盖低码候选已淘汰：\n" + "\n".join(dropped_notices[:5]),
             )
 
     @eventmanager.register(ChainEventType.ResourceDownload)
@@ -347,8 +349,38 @@ class BitrateSelector(_PluginBase):
             self.post_message(
                 mtype=None,
                 title="码率优选拦截",
-                text=f"{ctx.torrent_info.title}\n{data.reason}",
+                text=(
+                    f"{self._notify_media_label(ctx)}：估算 "
+                    f"{bitrate:.1f}Mbps，低于门槛 {self._veto_min_mbps:g}Mbps，已拦截"
+                ),
             )
+
+    @staticmethod
+    def _notify_media_label(ctx: Any) -> str:
+        """构造通知用的「剧名 + 季集」简短媒体标签。"""
+        media = getattr(ctx, "media_info", None)
+        meta = getattr(ctx, "meta_info", None)
+        title = (
+            getattr(media, "title", None)
+            or getattr(meta, "cn_name", None)
+            or getattr(meta, "en_name", None)
+            or ""
+        )
+        season_episode = str(getattr(meta, "season_episode", "") or "").replace(" ", "")
+        return f"{title} {season_episode}".strip() or "未知媒体"
+
+    @staticmethod
+    def _notify_version_label(ctx: Any) -> str:
+        """构造通知用的「发布组 + 特效」版本短标签，缺失时截取种子名。"""
+        meta = getattr(ctx, "meta_info", None)
+        parts = [
+            str(getattr(meta, "resource_team", "") or ""),
+            str(getattr(meta, "resource_effect", "") or ""),
+        ]
+        label = " ".join(part for part in parts if part)
+        if not label:
+            label = (getattr(getattr(ctx, "torrent_info", None), "title", "") or "")[:24]
+        return label
 
     def _apply_wash_patch(self) -> None:
         """按配置安装或移除洗版准入的码率优先补丁。"""
@@ -797,13 +829,13 @@ class BitrateSelector(_PluginBase):
 
     def _drop_dominated_candidates(
         self, contexts: List[Any]
-    ) -> Tuple[List[Any], List[str]]:
+    ) -> Tuple[List[Any], List[str], List[str]]:
         """
         按媒体身份与覆盖类别分组，淘汰被高码率候选覆盖的低码率候选。
 
-        :return: (保留的候选列表, 被淘汰候选的描述列表)
+        :return: (保留的候选列表, 日志用完整描述列表, 通知用简短描述列表)
         """
-        groups: Dict[str, List[Tuple[int, Set[int], float, str]]] = {}
+        groups: Dict[str, List[Tuple[int, Set[int], float, str, str, str]]] = {}
         for idx, ctx in enumerate(contexts):
             if not isinstance(ctx, Context) or not ctx.media_info or not ctx.torrent_info:
                 continue
@@ -821,29 +853,38 @@ class BitrateSelector(_PluginBase):
                 continue
             coverage = f"{season}:episodes" if episodes else f"{season}:pack"
             title = getattr(ctx.torrent_info, "title", "") or f"候选#{idx}"
+            media_label = self._notify_media_label(ctx)
+            version_label = self._notify_version_label(ctx)
             groups.setdefault(f"{group_key}|{coverage}", []).append(
-                (idx, episodes, bitrate, title)
+                (idx, episodes, bitrate, title, media_label, version_label)
             )
-        drop: Dict[int, str] = {}
+        drop: Dict[int, Tuple[str, str]] = {}
         margin = max(0, int(self._margin_percent)) / 100.0
         for items in groups.values():
-            for idx, eps, bitrate, title in items:
+            for idx, eps, bitrate, title, media_label, version_label in items:
                 if idx in drop:
                     continue
-                for jdx, eps2, bitrate2, title2 in items:
+                for jdx, eps2, bitrate2, title2, label2, version2 in items:
                     if jdx == idx or jdx in drop:
                         continue
                     if not self._covers(eps2, eps):
                         continue
                     if bitrate2 >= bitrate * (1 + margin):
                         drop[idx] = (
-                            f"{title}（{bitrate:.1f}Mbps）← 保留 {title2}（{bitrate2:.1f}Mbps）"
+                            (
+                                f"{title}（{bitrate:.1f}Mbps）← 保留 {title2}（{bitrate2:.1f}Mbps）"
+                            ),
+                            (
+                                f"{media_label}：淘汰 {version_label} {bitrate:.1f}Mbps"
+                                f" → 保留 {version2} {bitrate2:.1f}Mbps"
+                            ),
                         )
                         break
         if not drop:
-            return contexts, []
+            return contexts, [], []
         kept = [c for i, c in enumerate(contexts) if i not in drop]
-        return kept, list(drop.values())
+        dropped = list(drop.values())
+        return kept, [item[0] for item in dropped], [item[1] for item in dropped]
 
     def _estimate_bitrate(
         self, ctx: Context, episodes: Set[int]
