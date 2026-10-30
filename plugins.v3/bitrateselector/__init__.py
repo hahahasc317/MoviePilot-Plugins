@@ -49,7 +49,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -794,7 +794,8 @@ class BitrateSelector(_PluginBase):
         """
         扫描媒体库最近更新的低码集。
 
-        :return: {剧目录路径: {"label": 目录名, "season": 季号, "items": [(集标签, Mbps)]}}
+        :return: {剧目录路径: {"label": 目录名, "season": 季号,
+                 "eps": {集号: [各版本实测码率]}, "unknown": [(标签, 码率)]}}
         """
         result: Dict[str, Dict[str, Any]] = {}
         root = Path(self._library_root)
@@ -814,13 +815,54 @@ class BitrateSelector(_PluginBase):
             season_match = re.search(r"[Ss]eason\s*(\d+)", season_dir.name)
             season_num = int(season_match.group(1)) if season_match else 1
             episode_number = self._episode_from_filename(info_path.name)
-            episode_label = f"E{episode_number}" if episode_number else info_path.name[:24]
             entry = result.setdefault(
                 str(show_dir),
-                {"label": show_dir.name, "season": season_num, "items": []},
+                {"label": show_dir.name, "season": season_num, "eps": {}, "unknown": []},
             )
-            entry["items"].append((episode_label, round(bitrate, 1)))
+            rate = round(bitrate, 1)
+            if episode_number:
+                entry["eps"].setdefault(episode_number, []).append(rate)
+            else:
+                entry["unknown"].append((info_path.stem[:20], rate))
         return result
+
+    @staticmethod
+    def _compress_episode_ranges(numbers: List[int]) -> str:
+        """把集号列表压缩为「E10-E12、E19」形式的简短段落。"""
+        if not numbers:
+            return ""
+        ordered = sorted(set(numbers))
+        parts: List[str] = []
+        start = prev = ordered[0]
+        for num in ordered[1:]:
+            if num == prev + 1:
+                prev = num
+                continue
+            parts.append(f"E{start}-E{prev}" if prev > start else f"E{start}")
+            start = prev = num
+        parts.append(f"E{start}-E{prev}" if prev > start else f"E{start}")
+        return "、".join(parts)
+
+    @staticmethod
+    def _low_bitrate_group_summary(group: Dict[str, Any]) -> str:
+        """生成单个剧目录的低码摘要行：集段压缩 + 全体码率区间。"""
+        rates = [rate for rates in group.get("eps", {}).values() for rate in rates]
+        rates.extend(rate for _, rate in group.get("unknown", []))
+        if rates:
+            low, high = min(rates), max(rates)
+            range_text = (
+                f"（{low:.1f}-{high:.1f}Mbps）" if high > low else f"（{low:.1f}Mbps）"
+            )
+        else:
+            range_text = ""
+        episode_numbers = sorted(group.get("eps", {}).keys())
+        if episode_numbers:
+            episodes_text = BitrateSelector._compress_episode_ranges(episode_numbers)
+        elif group.get("unknown"):
+            episodes_text = "、".join(label for label, _ in group["unknown"][:2])
+        else:
+            episodes_text = "未知集"
+        return f"{group.get('label', '未知剧集')}：{episodes_text}{range_text}"
 
     def _low_bitrate_inspect(self) -> Dict[str, Any]:
         """
@@ -849,47 +891,60 @@ class BitrateSelector(_PluginBase):
         ]
         triggers = self.get_data(INSPECT_TRIGGERS_KEY) or {}
         now = time.time()
-        triggered: List[str] = []
-        observed: List[str] = []
+        triggered_rows: List[str] = []
+        triggered_labels: List[str] = []
+        throttled_rows: List[str] = []
+        unmatched_rows: List[str] = []
+        failed_rows: List[str] = []
         for group in low_groups.values():
             season_num = group.get("season", 1)
-            low_desc = "、".join(f"{name} {mbps}Mbps" for name, mbps in group["items"][:4])
+            summary = self._low_bitrate_group_summary(group)
             sid = self._match_subscribe_id(group["label"], season_num, subscriptions)
             if not sid:
-                observed.append(f"{group['label']}（无对应订阅）{low_desc}")
+                unmatched_rows.append(f"· {summary}")
                 continue
             if now - float(triggers.get(str(sid), 0)) < INSPECT_THROTTLE_SECONDS:
-                observed.append(f"{group['label']} {low_desc}（24小时内已触发，跳过）")
+                throttled_rows.append(f"· {summary}")
                 continue
             try:
                 SubscribeChain().search(sid=sid, manual=True)
             except Exception as err:
                 logger.error(f"码率优选：低码巡检触发订阅搜索失败（sid={sid}）：{err}")
-                observed.append(f"{group['label']} {low_desc}（触发失败：{err}）")
+                failed_rows.append(f"· {summary}（触发失败：{err}）")
                 continue
             triggers[str(sid)] = now
-            triggered.append(f"{group['label']}（低码 {len(group['items'])} 集）")
+            triggered_labels.append(group["label"])
+            triggered_rows.append(f"· {summary}")
             logger.info(
                 f"码率优选：低码巡检触发订阅搜索洗版 sid={sid}（{group['label']}）"
             )
-        if triggered:
+        if triggered_labels:
             self.save_data(INSPECT_TRIGGERS_KEY, triggers)
         logger.info(
             f"码率优选：低码巡检完成，发现 {len(low_groups)} 个低码目录，"
-            f"触发 {len(triggered)} 个订阅洗版搜索"
+            f"触发 {len(triggered_labels)} 个订阅洗版搜索"
         )
         if self._notify:
             lines: List[str] = []
-            if triggered:
-                lines.append("已自动触发订阅洗版搜索：" + "、".join(triggered))
-            for item in observed[:6]:
-                lines.append(f"· {item}")
+            if triggered_rows:
+                lines.append(f"发现低码集，已自动触发 {len(triggered_rows)} 部在订剧集的洗版搜索：")
+                lines.extend(triggered_rows)
+            if throttled_rows:
+                lines.append("以下今日已触发过洗版搜索，本轮跳过：")
+                lines.extend(throttled_rows[:4])
+            if failed_rows:
+                lines.append("以下触发失败，请留意：")
+                lines.extend(failed_rows[:4])
+            if unmatched_rows:
+                lines.append("以下剧集未订阅，不自动处理：")
+                lines.extend(unmatched_rows[:6])
             self.post_message(mtype=None, title="码率优选巡检", text="\n".join(lines))
         return {
             "success": True,
             "low": len(low_groups),
-            "triggered": triggered,
-            "observed": observed,
+            "triggered": triggered_labels,
+            "throttled": len(throttled_rows),
+            "unmatched": len(unmatched_rows),
         }
 
     def seed_baselines_from_library(self) -> Dict[str, Any]:
