@@ -43,7 +43,7 @@ class BitrateSelector(_PluginBase):
         "可选拦截低码率下载；支持洗版准入按估算码率优先，并可从媒体库播种实测基线。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -412,9 +412,10 @@ class BitrateSelector(_PluginBase):
 
         全集模式对比整季基线；分集模式按每集基线计算仍可提升的剧集范围。
         无法估算码率时回退原始规则优先级判定；基线缺失时保守处理：
-        全集模式回退原始判定，分集模式跳过缺基线的集，防止低码候选盲目洗版。
-        分集模式订阅整体无基线（库内尚无已入库集）时同样回退原始判定，
-        让新订阅正常完成初始下载。
+        全集模式回退原始判定，分集模式订阅整体无基线（库内尚无已入库集）
+        时同样回退原始判定，让新订阅正常完成初始下载。
+        部分库存时缺基线的集区分处理：库内未下载的集按初始补缺放行，
+        已下载但播种遗漏的集跳过防降级。
         候选与基线的时长来源不一致时（如基线为逐集实测、候选含中位数填充），
         准入阈值加倍，防止时长误差穿越边界。
         """
@@ -463,8 +464,8 @@ class BitrateSelector(_PluginBase):
         返回 None 表示候选无法估算码率，需回退原始判定。
         订阅无任何分集基线（库内尚无已入库集）时同样返回 None，
         交回核心初始下载判定，避免 0 库存新订阅被准入死锁。
-        已有部分基线时，无基线记录的集不参与码率优先洗版，
-        待库内播种补齐基线后再比较。
+        缺基线的集区分处理：库内未下载的集是待补缺的新集，按初始下载放行；
+        已下载但缺基线的集（播种遗漏）仍跳过，待库内播种补齐基线后再比较。
         """
         target_episodes = set(subscription_priority.get_best_version_target_episodes(subscribe))
         if not target_episodes:
@@ -486,6 +487,9 @@ class BitrateSelector(_PluginBase):
                 "回退核心判定放行初始下载，防止 0 库存订阅死锁"
             )
             return None
+        downloaded = set(
+            subscription_priority.get_downloaded_best_version_episodes(subscribe)
+        )
 
         def _threshold_for(baseline_source: str) -> float:
             """按候选与基线的时长来源是否一致计算该集的比较阈值。"""
@@ -499,20 +503,28 @@ class BitrateSelector(_PluginBase):
                 for episode in target_episodes
                 if episode_baselines.get(str(episode)) is None
             ]
-            if missing:
+            pending_new = sorted(ep for ep in missing if ep not in downloaded)
+            skipped_known = len(missing) - len(pending_new)
+            if skipped_known:
                 logger.debug(
-                    f"码率优选：{len(missing)} 集无码率基线，本轮不参与码率优先洗版"
+                    f"码率优选：{skipped_known} 集已下载但缺基线，本轮不参与码率优先洗版"
                 )
-            interested = sorted(
+            if pending_new:
+                logger.debug(
+                    f"码率优选：{len(pending_new)} 集库内未下载，按初始补缺放行"
+                )
+            washable = [
                 episode
                 for episode in target_episodes
                 if (baseline := episode_baselines.get(str(episode))) is not None
                 and float(baseline)
                 < _threshold_for(str(baseline_sources.get(str(episode), "measured")))
-            )
+            ]
+            interested = sorted(set(washable) | set(pending_new))
         else:
             interested = []
-            missing = 0
+            skipped_known = 0
+            pending_new = []
             for episode in selected_episodes:
                 try:
                     episode_num = int(episode)
@@ -522,17 +534,24 @@ class BitrateSelector(_PluginBase):
                     continue
                 baseline = episode_baselines.get(str(episode_num))
                 if baseline is None:
-                    missing += 1
+                    if episode_num in downloaded:
+                        skipped_known += 1
+                    else:
+                        pending_new.append(episode_num)
                     continue
                 if float(baseline) < _threshold_for(
                     str(baseline_sources.get(str(episode_num), "measured"))
                 ):
                     interested.append(episode_num)
-            if missing:
+            if skipped_known:
                 logger.debug(
-                    f"码率优选：{missing} 集无码率基线，本轮不参与码率优先洗版"
+                    f"码率优选：{skipped_known} 集已下载但缺基线，本轮不参与码率优先洗版"
                 )
-            interested = sorted(set(interested))
+            if pending_new:
+                logger.debug(
+                    f"码率优选：{len(pending_new)} 集库内未下载，按初始补缺放行"
+                )
+            interested = sorted(set(interested) | set(pending_new))
         if interested:
             episode_range = (
                 f"E{interested[0]}" if len(interested) == 1
