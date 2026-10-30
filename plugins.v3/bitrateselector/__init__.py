@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.chain.tmdb import TmdbChain
+from app.chain.subscribe import SubscribeChain
 from app.application.subscription import priority as subscription_priority
 from app.db.oper.subscribe import SubscribeOper
 from app.plugins import _PluginBase
@@ -24,6 +25,10 @@ RUNTIME_CACHE_TTL_SECONDS = 6 * 3600
 WASH_BASELINES_KEY = "wash_baselines"
 # 洗版基线默认的媒体库根目录（STRM 库挂载点）
 DEFAULT_LIBRARY_ROOT = "/media"
+# 低码巡检触发订阅搜索的节流时间（秒）
+INSPECT_THROTTLE_SECONDS = 24 * 3600
+# 低码巡检触发记录在插件数据中的存储键
+INSPECT_TRIGGERS_KEY = "inspect_triggers"
 
 
 class BitrateSelector(_PluginBase):
@@ -40,10 +45,11 @@ class BitrateSelector(_PluginBase):
     plugin_name = "码率优选"
     plugin_desc = (
         "下载前按「种子体积 ÷ 每集时长」估算码率，同覆盖范围自动优选高码率资源；"
-        "可选拦截低码率下载；支持洗版准入按估算码率优先，并可从媒体库播种实测基线。"
+        "可选拦截低码率下载；支持洗版准入按估算码率优先，从媒体库播种实测基线，"
+        "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.5"
+    plugin_version = "1.2.6"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -57,6 +63,9 @@ class BitrateSelector(_PluginBase):
     _notify = True
     _wash_enabled = False
     _library_root = DEFAULT_LIBRARY_ROOT
+    _inspect_enabled = False
+    _inspect_min_mbps = 8.0
+    _inspect_days = 30
     _baselines: Dict[str, Dict[str, Any]] = {}
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
@@ -80,6 +89,15 @@ class BitrateSelector(_PluginBase):
             str(config.get("library_root") or DEFAULT_LIBRARY_ROOT).rstrip("/")
             or DEFAULT_LIBRARY_ROOT
         )
+        self._inspect_enabled = bool(config.get("inspect_enabled"))
+        try:
+            self._inspect_min_mbps = max(0.0, float(config.get("inspect_min_mbps") or 8.0))
+        except (TypeError, ValueError):
+            self._inspect_min_mbps = 8.0
+        try:
+            self._inspect_days = max(1, int(float(config.get("inspect_days") or 30)))
+        except (TypeError, ValueError):
+            self._inspect_days = 30
         self._baselines = self.get_data(WASH_BASELINES_KEY) or {}
         self._apply_wash_patch()
         if self._wash_enabled:
@@ -149,6 +167,56 @@ class BitrateSelector(_PluginBase):
                                     {
                                         "component": "VSwitch",
                                         "props": {"model": "veto_enabled", "label": "低码率拦截"},
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "inspect_enabled",
+                                            "label": "低码巡检洗版",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "inspect_min_mbps",
+                                            "label": "低码巡检门槛(Mbps)",
+                                            "type": "number",
+                                            "hint": "媒体库实测码率低于此值视为低码，默认 8",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "inspect_days",
+                                            "label": "巡检范围(天)",
+                                            "type": "number",
+                                            "hint": "只检查最近 N 天内更新的条目，默认 30",
+                                            "persistent-hint": True,
+                                        },
                                     }
                                 ],
                             },
@@ -249,6 +317,9 @@ class BitrateSelector(_PluginBase):
             "margin_percent": 15,
             "veto_min_mbps": 8.0,
             "library_root": DEFAULT_LIBRARY_ROOT,
+            "inspect_enabled": False,
+            "inspect_min_mbps": 8.0,
+            "inspect_days": 30,
         }
         return form, defaults
 
@@ -275,18 +346,29 @@ class BitrateSelector(_PluginBase):
         self._tmdb_chain = None
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册每天 07:30 的库内基线播种服务。"""
-        if not (self._enabled and self._wash_enabled):
-            return []
-        return [
-            {
-                "id": "BitrateSelectorSeedBaselines",
-                "name": "码率基线库内播种",
-                "trigger": CronTrigger.from_crontab("30 7 * * *"),
-                "func": self._safe_seed_baselines,
-                "kwargs": {},
-            }
-        ]
+        """注册库内基线播种与低码巡检自动洗版定时服务。"""
+        services: List[Dict[str, Any]] = []
+        if self._enabled and self._wash_enabled:
+            services.append(
+                {
+                    "id": "BitrateSelectorSeedBaselines",
+                    "name": "码率基线库内播种",
+                    "trigger": CronTrigger.from_crontab("30 7 * * *"),
+                    "func": self._safe_seed_baselines,
+                    "kwargs": {},
+                }
+            )
+        if self._enabled and self._inspect_enabled:
+            services.append(
+                {
+                    "id": "BitrateSelectorLowBitrateInspect",
+                    "name": "低码巡检自动洗版",
+                    "trigger": CronTrigger.from_crontab("30 10 * * *"),
+                    "func": self._safe_low_bitrate_inspect,
+                    "kwargs": {},
+                }
+            )
+        return services
 
     @eventmanager.register(ChainEventType.ResourceSelection)
     def select_high_bitrate(self, event: Event) -> None:
@@ -673,6 +755,142 @@ class BitrateSelector(_PluginBase):
         except Exception as err:
             logger.error(f"码率优选：库内基线播种失败：{err}")
             return {"success": False, "seeded": 0, "message": str(err)}
+
+    def _safe_low_bitrate_inspect(self) -> Dict[str, Any]:
+        """执行低码巡检并吞掉异常，返回结果摘要。"""
+        try:
+            return self._low_bitrate_inspect()
+        except Exception as err:
+            logger.error(f"码率优选：低码巡检失败：{err}")
+            return {"success": False, "low": 0, "triggered": [], "message": str(err)}
+
+    @staticmethod
+    def _parse_show_dir_name(dir_name: str) -> str:
+        """解析剧目录名为可比较的规范剧名（去年份与空白）。"""
+        base = re.sub(r"\(\d{4}\)\s*$", "", str(dir_name or "").strip())
+        return re.sub(r"\s+", "", base)
+
+    def _match_subscribe_id(
+        self, dir_name: str, season_num: int, subscriptions: List[Any]
+    ) -> Optional[Any]:
+        """按目录名与季号匹配在订订阅，返回订阅 ID 或 None。"""
+        normalized = self._parse_show_dir_name(dir_name)
+        if not normalized:
+            return None
+        for subscribe in subscriptions:
+            name = self._parse_show_dir_name(str(getattr(subscribe, "name", "") or ""))
+            if not name:
+                continue
+            if name == normalized or name in normalized or normalized in name:
+                subscribe_season = getattr(subscribe, "season", None) or 1
+                try:
+                    if int(subscribe_season or 1) == int(season_num):
+                        return getattr(subscribe, "id", None)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _scan_low_bitrate_items(self, cutoff: float) -> Dict[str, Dict[str, Any]]:
+        """
+        扫描媒体库最近更新的低码集。
+
+        :return: {剧目录路径: {"label": 目录名, "season": 季号, "items": [(集标签, Mbps)]}}
+        """
+        result: Dict[str, Dict[str, Any]] = {}
+        root = Path(self._library_root)
+        if not root.is_dir():
+            return result
+        for info_path in root.rglob("*-mediainfo.json"):
+            try:
+                if info_path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            bitrate = self._mediainfo_bitrate_mbps(info_path)
+            if bitrate is None or bitrate >= self._inspect_min_mbps:
+                continue
+            season_dir = info_path.parent
+            show_dir = season_dir.parent
+            season_match = re.search(r"[Ss]eason\s*(\d+)", season_dir.name)
+            season_num = int(season_match.group(1)) if season_match else 1
+            episode_number = self._episode_from_filename(info_path.name)
+            episode_label = f"E{episode_number}" if episode_number else info_path.name[:24]
+            entry = result.setdefault(
+                str(show_dir),
+                {"label": show_dir.name, "season": season_num, "items": []},
+            )
+            entry["items"].append((episode_label, round(bitrate, 1)))
+        return result
+
+    def _low_bitrate_inspect(self) -> Dict[str, Any]:
+        """
+        巡检媒体库低码集，并对匹配的在订订阅自动触发订阅搜索洗版。
+
+        搜索由订阅规则组与码率优选准入把关，只会补缺或升级到更高码版本；
+        同一订阅 24 小时内只触发一次，避免无高码资源时反复搜索。
+        """
+        if not (self._enabled and self._inspect_enabled):
+            return {"success": False, "low": 0, "triggered": [], "message": "插件或低码巡检未启用"}
+        cutoff = time.time() - max(1, self._inspect_days) * 86400
+        low_groups = self._scan_low_bitrate_items(cutoff)
+        if not low_groups:
+            logger.info("码率优选：低码巡检完成，最近更新条目均高于门槛")
+            if self._notify:
+                self.post_message(
+                    mtype=None,
+                    title="码率优选巡检",
+                    text="近期新增/更新的媒体条目均高于低码门槛。",
+                )
+            return {"success": True, "low": 0, "triggered": []}
+        subscriptions = [
+            subscribe
+            for subscribe in (SubscribeOper().list() or [])
+            if getattr(subscribe, "type", None) == MediaType.TV.value
+        ]
+        triggers = self.get_data(INSPECT_TRIGGERS_KEY) or {}
+        now = time.time()
+        triggered: List[str] = []
+        observed: List[str] = []
+        for group in low_groups.values():
+            season_num = group.get("season", 1)
+            low_desc = "、".join(f"{name} {mbps}Mbps" for name, mbps in group["items"][:4])
+            sid = self._match_subscribe_id(group["label"], season_num, subscriptions)
+            if not sid:
+                observed.append(f"{group['label']}（无对应订阅）{low_desc}")
+                continue
+            if now - float(triggers.get(str(sid), 0)) < INSPECT_THROTTLE_SECONDS:
+                observed.append(f"{group['label']} {low_desc}（24小时内已触发，跳过）")
+                continue
+            try:
+                SubscribeChain().search(sid=sid, manual=True)
+            except Exception as err:
+                logger.error(f"码率优选：低码巡检触发订阅搜索失败（sid={sid}）：{err}")
+                observed.append(f"{group['label']} {low_desc}（触发失败：{err}）")
+                continue
+            triggers[str(sid)] = now
+            triggered.append(f"{group['label']}（低码 {len(group['items'])} 集）")
+            logger.info(
+                f"码率优选：低码巡检触发订阅搜索洗版 sid={sid}（{group['label']}）"
+            )
+        if triggered:
+            self.save_data(INSPECT_TRIGGERS_KEY, triggers)
+        logger.info(
+            f"码率优选：低码巡检完成，发现 {len(low_groups)} 个低码目录，"
+            f"触发 {len(triggered)} 个订阅洗版搜索"
+        )
+        if self._notify:
+            lines: List[str] = []
+            if triggered:
+                lines.append("已自动触发订阅洗版搜索：" + "、".join(triggered))
+            for item in observed[:6]:
+                lines.append(f"· {item}")
+            self.post_message(mtype=None, title="码率优选巡检", text="\n".join(lines))
+        return {
+            "success": True,
+            "low": len(low_groups),
+            "triggered": triggered,
+            "observed": observed,
+        }
 
     def seed_baselines_from_library(self) -> Dict[str, Any]:
         """
