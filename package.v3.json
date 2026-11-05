@@ -31,5 +31,17 @@
     "history": {
       "v1.0.0": "初始版本：TransferComplete 事件定向复查 + 定时全量扫描 + SHA1 秒传重建 + 孤儿边车清理 + 通知（移植自 2026-10-25 实证修复脚本）"
     }
+  },
+  "VarietyPurifier": {
+    "name": "综艺正片净化",
+    "description": "自动下载的综艺在整理入库时拦截加更/花絮/纯享/先导等非正片文件及 Part 分半文件，防止占号污染媒体库；手动下载放行，文件保留在下载目录不影响做种。",
+    "labels": "文件整理",
+    "version": "1.0.0",
+    "author": "hahahasc317",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "初始版本：TransferIntercept 整理阶段逐文件拦截 + DownloadAdded 手动/订阅来源判别 + 可配置关键词/Part/E00 规则 + 聚合通知（2026-11-06 现在就出发 S04 加更占号实证）"
+    }
   }
 }
