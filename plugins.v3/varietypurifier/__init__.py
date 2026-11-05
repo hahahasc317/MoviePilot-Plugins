@@ -9,7 +9,7 @@ from app.sdk.logging import logger
 from app.schemas.types import ChainEventType, EventType, MediaType
 
 from . import purifier
-from .purifier import DEFAULT_KEYWORDS, decide, is_subscribe_source
+from .purifier import DEFAULT_KEYWORDS, decide, is_subscribe_source, match_keyword
 
 DATA_SOURCES_KEY = "torrent_sources"
 DATA_BLOCKS_KEY = "recent_blocks"
@@ -23,11 +23,12 @@ class VarietyPurifier(_PluginBase):
 
     plugin_name = "综艺正片净化"
     plugin_desc = (
-        "自动下载的综艺在整理入库时拦截加更/花絮/纯享/先导等非正片文件及 Part 半集，"
-        "防止占号污染媒体库；手动下载放行。文件保留在下载目录不删除，不影响做种。"
+        "自动下载的综艺拦截非正片：下载准入时整包拒收命中加更/花絮/纯享等标记的种子（手动放行），"
+        "整理入库时逐文件拦截漏网的非正片及 Part 半集，防止占号污染媒体库；"
+        "被拦文件保留在下载目录不影响做种。"
     )
     plugin_icon = ""
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "varietypurifier_"
     plugin_order = 16
@@ -39,6 +40,7 @@ class VarietyPurifier(_PluginBase):
     _block_special_ep = True
     _notify = True
     _exempt_manual = True
+    _block_download = True
     _keywords: Tuple[str, ...] = DEFAULT_KEYWORDS
 
     _torrent_sources: Dict[str, Dict[str, Any]] = {}
@@ -60,6 +62,7 @@ class VarietyPurifier(_PluginBase):
         self._block_special_ep = bool(config.get("block_special_ep", True))
         self._notify = bool(config.get("notify", True))
         self._exempt_manual = bool(config.get("exempt_manual", True))
+        self._block_download = bool(config.get("block_download", True))
         raw_keywords = str(config.get("keywords") or "").strip()
         if raw_keywords:
             self._keywords = tuple(
@@ -74,7 +77,8 @@ class VarietyPurifier(_PluginBase):
         logger.info(
             f"综艺正片净化：已{'启用' if self._enabled else '停用'}，"
             f"仅综艺={self._scope_variety_only}，拦Part={self._block_parts}，"
-            f"拦E00={self._block_special_ep}，手动放行={self._exempt_manual}，"
+            f"拦E00={self._block_special_ep}，下载准入拦截={self._block_download}，"
+            f"手动放行={self._exempt_manual}，"
             f"关键词 {len(self._keywords)} 个，来源映射 {len(self._torrent_sources)} 条"
         )
 
@@ -156,6 +160,19 @@ class VarietyPurifier(_PluginBase):
                                     {
                                         "component": "VSwitch",
                                         "props": {
+                                            "model": "block_download",
+                                            "label": "下载准入拦截：订阅种子命中非正片标记整包拒收（手动放行）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
                                             "model": "block_special_ep",
                                             "label": "拦截 E00 特殊集号",
                                         },
@@ -195,6 +212,7 @@ class VarietyPurifier(_PluginBase):
             "enabled": False,
             "scope_variety_only": True,
             "exempt_manual": True,
+            "block_download": True,
             "block_parts": True,
             "block_special_ep": True,
             "notify": True,
@@ -312,6 +330,44 @@ class VarietyPurifier(_PluginBase):
             self._record_block(filename, reason)
         except Exception as err:
             logger.error(f"综艺正片净化：整理拦截处理失败：{err}")
+
+    @eventmanager.register(ChainEventType.ResourceDownload)
+    def on_resource_download(self, event: Event = None) -> None:
+        """下载提交前裁决：非手动来源的综艺种子命中非正片标记时整包拒收。"""
+        if not self._enabled or not self._block_download:
+            return
+        try:
+            data = getattr(event, "event_data", None)
+            if data is None or getattr(data, "cancel", False):
+                return
+            if self._exempt_manual and str(getattr(data, "origin", "") or "") == "Manual":
+                return
+            context = getattr(data, "context", None)
+            torrent_info = getattr(context, "torrent_info", None)
+            mediainfo = getattr(context, "media_info", None)
+            if torrent_info is None or mediainfo is None:
+                return
+            if self._media_type_str(mediainfo) != "电视剧":
+                return
+            category = str(
+                getattr(mediainfo, "library_category", "")
+                or getattr(mediainfo, "category", "")
+                or ""
+            )
+            if self._scope_variety_only and "综艺" not in category:
+                return
+            title = str(getattr(torrent_info, "title", "") or "")
+            description = str(getattr(torrent_info, "description", "") or "")
+            keyword = match_keyword(f"{title} {description}".strip(), self._keywords)
+            if not keyword:
+                return
+            data.cancel = True
+            data.source = "综艺正片净化"
+            data.reason = f"种子含非正片内容（命中 {keyword}），整包拒收"
+            logger.info(f"综艺正片净化：下载准入拦截 {title}（命中 {keyword}）")
+            self._record_block(title, f"下载拦截：命中 {keyword}")
+        except Exception as err:
+            logger.error(f"综艺正片净化：下载准入拦截处理失败：{err}")
 
     def _media_type_str(self, mediainfo: Any) -> str:
         """把媒体信息对象的类型字段规范化为字符串。"""
