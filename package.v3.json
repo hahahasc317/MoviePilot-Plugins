@@ -19,5 +19,17 @@
       "v1.0.0": "初始版本：ResourceSelection 同覆盖择优 + ResourceDownload 低码率拦截",
       "v1.2.2": "单集时长三级回退（TMDB→库内实测→同季中位），综艺缺 TMDB 时长不再堵死洗版；时长来源不一致时准入阈值加倍"
     }
+  },
+  "MPStageFixer": {
+    "name": "MP暂存残留修复",
+    "description": "自动检测并修复 115 网盘上的 mp-stage 暂存残留（CloudDrive2 带**尾巴 / 115网盘Plus 丢扩展名变体），SHA1 秒传重建恢复 strm 缺集；整理完成后即时定向检测 + 定时全量扫描兜底，支持 /mpstage_fix 手动触发。",
+    "labels": "存储同步",
+    "version": "1.0.0",
+    "author": "hahahasc317",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "初始版本：TransferComplete 事件定向复查 + 定时全量扫描 + SHA1 秒传重建 + 孤儿边车清理 + 通知（移植自 2026-10-25 实证修复脚本）"
+    }
   }
 }
