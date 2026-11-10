@@ -49,7 +49,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.7"
+    plugin_version = "1.2.8"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -580,11 +580,18 @@ class BitrateSelector(_PluginBase):
         交回核心初始下载判定，避免 0 库存新订阅被准入死锁。
         缺基线的集区分处理：库内未下载的集是待补缺的新集，按初始下载放行；
         已下载但缺基线的集（播种遗漏）仍跳过，待库内播种补齐基线后再比较。
+        标题解析出明确集数边界时，待补/待洗范围先限定在候选包自身集数内。
         """
         target_episodes = set(subscription_priority.get_best_version_target_episodes(subscribe))
         if not target_episodes:
             return []
         meta = context.meta_info
+        # 整季无明确集号的候选按标题解析的集数范围限定目标集：
+        # 季内尚未播出的远端集不在包内，不能当作本包待补缺，
+        # 否则准入放行后与包内真实集求交为空，下载阶段永远跳过并每轮重复发通知。
+        span = self._candidate_episode_span(meta, target_episodes)
+        if span is not None:
+            target_episodes &= span
         selected_episodes = getattr(context, "selected_episodes", None)
         if selected_episodes is None:
             selected_episodes = meta.episode_list if meta else []
@@ -679,6 +686,27 @@ class BitrateSelector(_PluginBase):
                 f"码率优选：分集洗版候选 {candidate_mbps:.1f}Mbps 无可提升剧集，拒绝（{title}）"
             )
         return interested
+
+    @staticmethod
+    def _candidate_episode_span(
+        meta: Any, target_episodes: Set[int]
+    ) -> Optional[Set[int]]:
+        """
+        从标题解析的集数边界推断候选包的真实覆盖范围。
+
+        仅当标题解析出明确集数边界（起始集、结束集或总集数）时，
+        返回该范围与洗版目标集的交集；无明确集号的候选返回 None，
+        保持原有目标范围不变。用于整季包场景：季内未播的远端集
+        不在包内，不应被当作待补缺重复放行。
+        """
+        if meta is None:
+            return None
+        span_start = getattr(meta, "begin_episode", None) or 1
+        span_end = getattr(meta, "end_episode", None) or getattr(meta, "total_episode", None)
+        if not span_end or span_end < span_start:
+            return None
+        span = set(range(span_start, span_end + 1)) & target_episodes
+        return span or None
 
     def _wash_baseline_entry(self, subscribe: Any) -> Dict[str, Any]:
         """读取指定订阅媒体与季的码率基线记录。"""
