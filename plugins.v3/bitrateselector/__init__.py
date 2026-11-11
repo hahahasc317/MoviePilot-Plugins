@@ -1083,17 +1083,17 @@ class BitrateSelector(_PluginBase):
         season = getattr(subscribe, "season", None) or 1
         show_dir = self._find_show_dir(root, name, year)
         if show_dir is None:
-            return -1
+            return -1, -1
         season_dir = self._find_season_dir(show_dir, season)
         if season_dir is None:
-            return -1
+            return -1, -1
         key = self._wash_media_key(
             source=getattr(subscribe, "media_source", None),
             media_id=getattr(subscribe, "media_id", None),
             season=season,
         )
         if not key:
-            return -1
+            return -1, -1
         entry = self._baselines.setdefault(key, {})
         episode_map = entry.setdefault("episodes", {})
         seeded = 0
