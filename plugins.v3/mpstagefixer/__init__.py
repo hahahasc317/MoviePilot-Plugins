@@ -11,8 +11,11 @@ from app.schemas.types import EventType
 
 DEFAULT_CRON = "15 */6 * * *"
 REPORT_KEY = "last_report"
+REVIEW_KEY = "last_review_report"
+DEFAULT_REVIEW_CRON = "*/30 * * * *"
 QUICK_DELAY_SECONDS = 120
 RUN_LOCK = threading.Lock()
+REVIEW_LOCK = threading.Lock()
 
 
 class MPStageFixer(_PluginBase):
@@ -21,10 +24,11 @@ class MPStageFixer(_PluginBase):
     plugin_name = "MP暂存残留修复"
     plugin_desc = (
         "自动检测并修复 115 网盘上的 mp-stage 暂存残留（CD2 带**尾巴 / Plus 丢扩展名变体），"
-        "SHA1 秒传重建恢复 strm 缺集；整理完成后即时定向检测 + 定时全量扫描兜底。"
+        "SHA1 秒传重建恢复 strm 缺集；整理完成后即时定向检测 + 定时全量扫描兜底；"
+        "定时核验 durable 整理待复核任务，仅对目标可证实的步骤自动判定 applied。"
     )
     plugin_icon = ""
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "mpstagefixer_"
     plugin_order = 15
@@ -36,6 +40,8 @@ class MPStageFixer(_PluginBase):
     _orphan_clean = True
     _sweep_cron = DEFAULT_CRON
     _max_dirs = 3000
+    _review_enabled = True
+    _review_cron = DEFAULT_REVIEW_CRON
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。"""
@@ -51,9 +57,14 @@ class MPStageFixer(_PluginBase):
             self._max_dirs = max(50, int(config.get("max_dirs") or 3000))
         except (TypeError, ValueError):
             self._max_dirs = 3000
+        self._review_enabled = bool(config.get("review_enabled", True))
+        review_cron = str(config.get("review_cron") or "").strip()
+        self._review_cron = review_cron or DEFAULT_REVIEW_CRON
         logger.info(
             f"MPStageFixer：已{'启用' if self._enabled else '停用'}，"
-            f"即时检测={self._quick_check}，扫描周期={self._sweep_cron}"
+            f"即时检测={self._quick_check}，扫描周期={self._sweep_cron}，"
+            f"待复核自动判定={'开' if self._review_enabled else '关'}"
+            f"（{self._review_cron}）"
         )
 
     def get_state(self) -> bool:
@@ -70,7 +81,14 @@ class MPStageFixer(_PluginBase):
                 "desc": "立即扫描修复mp-stage残留",
                 "category": "",
                 "data": {"action": "mpstage_fix"},
-            }
+            },
+            {
+                "cmd": "/mpstage_review",
+                "event": EventType.PluginAction,
+                "desc": "立即核验判定整理待复核任务",
+                "category": "",
+                "data": {"action": "mpstage_review"},
+            },
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -166,6 +184,33 @@ class MPStageFixer(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "review_enabled",
+                                            "label": "待复核任务自动判定（仅目标核验一致才判 applied）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "review_cron",
+                                            "label": "待复核核验周期（cron 表达式）",
+                                            "placeholder": DEFAULT_REVIEW_CRON,
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     }
                 ],
@@ -177,10 +222,18 @@ class MPStageFixer(_PluginBase):
             "orphan_clean": True,
             "sweep_cron": DEFAULT_CRON,
             "max_dirs": 3000,
+            "review_enabled": True,
+            "review_cron": DEFAULT_REVIEW_CRON,
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回插件详情页面（最近一次扫描修复报告）。"""
+        """返回插件详情页面（最近扫描修复与待复核判定报告）。"""
+        content = self._scan_page_content()
+        content.extend(self._review_page_content())
+        return content
+
+    def _scan_page_content(self) -> List[dict]:
+        """构造最近一次扫描修复报告内容。"""
         report = self.get_data(REPORT_KEY) or {}
         if not report:
             return [
@@ -219,8 +272,34 @@ class MPStageFixer(_PluginBase):
             )
         return content
 
+    def _review_page_content(self) -> List[dict]:
+        """构造最近一次待复核判定报告内容。"""
+        report = self.get_data(REVIEW_KEY) or {}
+        if not report:
+            return []
+        lines = [
+            f"时间：{report.get('time', '-')}　来源：{report.get('source', '-')}",
+            f"待复核：{report.get('scanned', 0)}　自动判定：{report.get('resolved', 0)}"
+            f"　跳过：{report.get('skipped', 0)}　冲突：{report.get('conflict', 0)}",
+        ]
+        if report.get("rate_limited"):
+            lines.append("上轮存储查询被限流，已中止等待下轮")
+        details = report.get("details") or []
+        if details:
+            lines.append("　".join(details[:6]))
+        return [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "title": "最近一次待复核判定报告",
+                    "text": "\n".join(lines),
+                },
+            }
+        ]
+
     def get_service(self) -> List[Dict[str, Any]]:
-        """注册 mp-stage 残留定时全量扫描服务。"""
+        """注册 mp-stage 残留定时扫描与待复核自动判定服务。"""
         if not self._enabled:
             return []
         try:
@@ -235,8 +314,27 @@ class MPStageFixer(_PluginBase):
                 "trigger": trigger,
                 "func": self._safe_sweep,
                 "kwargs": {},
-            }
+            },
         ]
+        if self._review_enabled:
+            try:
+                review_trigger = CronTrigger.from_crontab(self._review_cron)
+            except ValueError:
+                logger.warning(
+                    f"MPStageFixer：待复核 cron 表达式无效（{self._review_cron}），"
+                    f"回退默认 {DEFAULT_REVIEW_CRON}"
+                )
+                review_trigger = CronTrigger.from_crontab(DEFAULT_REVIEW_CRON)
+            services.append(
+                {
+                    "id": "MPStageFixerReview",
+                    "name": "整理待复核任务自动判定",
+                    "trigger": review_trigger,
+                    "func": self._safe_review,
+                    "kwargs": {},
+                }
+            )
+        return services
 
     def stop_service(self) -> None:
         """停止插件后台服务并释放资源。"""
@@ -274,11 +372,22 @@ class MPStageFixer(_PluginBase):
 
     @eventmanager.register(EventType.PluginAction)
     def on_plugin_action(self, event: Event = None) -> None:
-        """响应 /mpstage_fix 命令，立即执行全量扫描修复。"""
+        """响应 /mpstage_fix 与 /mpstage_review 命令，立即执行对应任务。"""
         if not self._enabled:
             return
         event_data = getattr(event, "event_data", None)
-        if not event_data or event_data.get("action") != "mpstage_fix":
+        action = event_data.get("action") if event_data else None
+        if action == "mpstage_review":
+            if not self._review_enabled:
+                return
+            threading.Thread(
+                target=self._run_review,
+                kwargs={"source": "manual"},
+                name="mpstagefixer-review",
+                daemon=True,
+            ).start()
+            return
+        if action != "mpstage_fix":
             return
         threading.Thread(
             target=self._run_sweep,
@@ -293,6 +402,56 @@ class MPStageFixer(_PluginBase):
             self._run_sweep(source="sweep")
         except Exception as err:
             logger.error(f"MPStageFixer：定时扫描失败：{err}")
+
+    def _safe_review(self) -> None:
+        """定时待复核判定入口，吞掉异常避免影响调度器。"""
+        try:
+            self._run_review(source="sweep")
+        except Exception as err:
+            logger.error(f"MPStageFixer：待复核判定失败：{err}")
+
+    def _run_review(self, source: str = "sweep") -> Dict[str, Any]:
+        """执行一轮待复核核验判定，保存报告并按需通知。
+
+        仅 review.verify_task 判定可证实的任务会提交 applied；
+        大小不符、目标缺失、不支持的步骤一律保留给人工。
+        """
+        if not REVIEW_LOCK.acquire(blocking=False):
+            logger.info("MPStageFixer：已有待复核判定在运行，本次跳过")
+            return {}
+        try:
+            from . import review
+
+            report = review.run_review()
+            report["time"] = self._now()
+            report["source"] = source
+            self._save_review_report(report)
+            return report
+        finally:
+            REVIEW_LOCK.release()
+
+    def _save_review_report(self, report: Dict[str, Any]) -> None:
+        """保存最近判定报告；结果有变化或有限流时推送通知。"""
+        old = self.get_data(REVIEW_KEY) or {}
+        self.save_data(REVIEW_KEY, report)
+        if not self._notify:
+            return
+        resolved = report.get("resolved", 0)
+        unresolved = set(report.get("unresolved") or [])
+        old_unresolved = set(old.get("unresolved") or [])
+        if resolved <= 0 and unresolved == old_unresolved and not report.get("rate_limited"):
+            return
+        lines = [
+            f"时间：{report.get('time', '-')}",
+            f"待复核：{report.get('scanned', 0)}　自动判定：{resolved}"
+            f"　留人工：{len(unresolved)}",
+        ]
+        if report.get("rate_limited"):
+            lines.append("存储查询被限流，本轮中止，下轮自动重试")
+        details = report.get("details") or []
+        if details:
+            lines.extend(details[:8])
+        self.post_message(mtype=None, title="MP整理待复核判定", text="\n".join(lines))
 
     def _run_sweep(self, source: str = "sweep") -> Dict[str, Any]:
         """全量扫描媒体库并修复残留，返回并保存报告。"""

@@ -23,14 +23,15 @@
   },
   "MPStageFixer": {
     "name": "MP暂存残留修复",
-    "description": "自动检测并修复 115 网盘上的 mp-stage 暂存残留（CloudDrive2 带**尾巴 / 115网盘Plus 丢扩展名变体），SHA1 秒传重建恢复 strm 缺集；整理完成后即时定向检测 + 定时全量扫描兜底，支持 /mpstage_fix 手动触发。",
+    "description": "自动检测并修复 115 网盘上的 mp-stage 暂存残留（CloudDrive2 带**尾巴 / 115网盘Plus 丢扩展名变体），SHA1 秒传重建恢复 strm 缺集；整理完成后即时定向检测 + 定时全量扫描兜底；定时核验 durable 整理待复核任务，仅对目标存在且大小一致的步骤自动判定 applied，其余留人工并通知，支持 /mpstage_fix、/mpstage_review 手动触发。",
     "labels": "存储同步",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "hahahasc317",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
-      "v1.0.0": "初始版本：TransferComplete 事件定向复查 + 定时全量扫描 + SHA1 秒传重建 + 孤儿边车清理 + 通知（移植自 2026-10-25 实证修复脚本）"
+      "v1.0.0": "初始版本：TransferComplete 事件定向复查 + 定时全量扫描 + SHA1 秒传重建 + 孤儿边车清理 + 通知（移植自 2026-10-25 实证修复脚本）",
+      "v1.1.0": "新增 durable 整理待复核自动判定：定时（默认每 30 分钟，可配 cron）扫描 manual_review 队列，落地/晋级类步骤经 StorageChain 实测目标存在且大小与源一致才提交 applied（result_payload 携带目标 FileItem，避免误结算失败历史），大小不符、目标缺失、不支持类别一律留人工并通知；115 限流自动熔断本轮；新增 /mpstage_review 命令"
     }
   },
   "VarietyPurifier": {
