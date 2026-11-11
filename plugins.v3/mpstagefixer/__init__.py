@@ -307,7 +307,7 @@ class MPStageFixer(_PluginBase):
         except ValueError:
             logger.warning(f"MPStageFixer：cron 表达式无效（{self._sweep_cron}），回退默认 {DEFAULT_CRON}")
             trigger = CronTrigger.from_crontab(DEFAULT_CRON)
-        return [
+        services = [
             {
                 "id": "MPStageFixerSweep",
                 "name": "mp-stage 残留定时扫描修复",
