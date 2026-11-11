@@ -23,6 +23,8 @@ from app.schemas.types import ChainEventType, MediaType
 RUNTIME_CACHE_TTL_SECONDS = 6 * 3600
 # 洗版码率基线在插件数据中的存储键
 WASH_BASELINES_KEY = "wash_baselines"
+# 洗版基线与库内实测/既有值之间的最大合理倍差，超出视为异常需校正或拒绝记录
+WASH_BASELINE_MAX_DIVERGENCE = 2.0
 # 洗版基线默认的媒体库根目录（STRM 库挂载点）
 DEFAULT_LIBRARY_ROOT = "/media"
 # 低码巡检触发订阅搜索的节流时间（秒）
@@ -49,7 +51,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.8"
+    plugin_version = "1.2.9"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -298,7 +300,8 @@ class BitrateSelector(_PluginBase):
                                                 "候选与基线的时长来源不一致（如一方含中位数填充）时阈值自动加倍；"
                                                 "规则组仍负责资源资格筛选。开启后会扫描媒体库根目录下"
                                                 " P115StrmHelper 生成的 -mediainfo.json，为没有基线的剧集"
-                                                "播种实测码率，并每天 07:30 自动补充。"
+                                                "播种实测码率，倍差超过 2 倍的异常基线自动按实测校正，"
+                                                "并每天 07:30 自动补充。"
                                             ),
                                         },
                                     }
@@ -732,7 +735,13 @@ class BitrateSelector(_PluginBase):
         return f"{source}:{media_id}:{season_number}"
 
     def _record_wash_baseline(self, data: ResourceDownloadEventData) -> None:
-        """下载提交后按覆盖剧集记录估算码率基线。"""
+        """
+        下载提交后按覆盖剧集记录估算码率基线。
+
+        估算值与同集既有基线倍差超过 WASH_BASELINE_MAX_DIVERGENCE 时拒绝
+        覆盖并告警：整季包集数解析不全会让估算虚高数倍，直接覆盖会把
+        洗版准入门槛抬到不可达；被拒集保留既有值，待库内播种按实测校正。
+        """
         ctx = data.context
         meta = ctx.meta_info
         if data.episodes:
@@ -757,23 +766,61 @@ class BitrateSelector(_PluginBase):
             return
         try:
             entry = self._baselines.setdefault(key, {})
+            new_value = round(bitrate, 2)
+            refused: List[str] = []
             if episodes:
                 episode_map = entry.setdefault("episodes", {})
                 source_map = entry.setdefault("ep_sources", {})
-                for episode in episodes:
-                    episode_map[str(episode)] = round(bitrate, 2)
-                    source_map[str(episode)] = duration_source
+                for episode in sorted(episodes):
+                    ep_key = str(episode)
+                    existing = episode_map.get(ep_key)
+                    if existing is not None and self._baseline_diverged(
+                        existing, new_value
+                    ):
+                        refused.append(
+                            f"E{episode}（新估算 {new_value:.2f} / 既有 {float(existing):.2f}）"
+                        )
+                        continue
+                    episode_map[ep_key] = new_value
+                    source_map[ep_key] = duration_source
             else:
-                entry["full"] = round(bitrate, 2)
-                entry["full_source"] = duration_source
+                existing = entry.get("full")
+                if existing is not None and self._baseline_diverged(existing, new_value):
+                    refused.append(
+                        f"全集（新估算 {new_value:.2f} / 既有 {float(existing):.2f}）"
+                    )
+                else:
+                    entry["full"] = new_value
+                    entry["full_source"] = duration_source
             self.save_data(WASH_BASELINES_KEY, self._baselines)
         except Exception as err:
             logger.error(f"码率优选：保存码率基线失败：{err}")
             return
+        if refused:
+            shown = "；".join(refused[:8]) + ("等" if len(refused) > 8 else "")
+            logger.warning(
+                f"码率优选：估算基线疑似异常，拒绝覆盖 {key} {shown}"
+                f"（倍差超过 {WASH_BASELINE_MAX_DIVERGENCE:g} 倍，"
+                "保留既有基线，待库内播种按实测校正）"
+            )
         logger.info(
             f"码率优选：记录洗版码率基线 {key} "
             f"{sorted(episodes) if episodes else '全集'} => {bitrate:.2f}Mbps"
             f"（时长来源={duration_source}）"
+        )
+
+    @staticmethod
+    def _baseline_diverged(existing: Any, candidate: float) -> bool:
+        """判断候选基线与既有基线是否倍差超过合理阈值（默认 2 倍）。"""
+        try:
+            old = float(existing)
+        except (TypeError, ValueError):
+            return False
+        if old <= 0 or candidate <= 0:
+            return False
+        return (
+            candidate > old * WASH_BASELINE_MAX_DIVERGENCE
+            or candidate < old / WASH_BASELINE_MAX_DIVERGENCE
         )
 
     def _safe_seed_baselines(self) -> Dict[str, Any]:
@@ -979,7 +1026,8 @@ class BitrateSelector(_PluginBase):
         """
         扫描媒体库 mediainfo，为尚无基线的剧集填充实测码率。
 
-        只补空缺、不覆盖下载时记录的基线；已下载集以事件记录为准。
+        只补空缺；已有基线与库内实测倍差超过 WASH_BASELINE_MAX_DIVERGENCE
+        时（下载提交时的估算虚高，或版本升级后基线陈旧），以实测覆盖。
         """
         if not (self._enabled and self._wash_enabled):
             return {"success": False, "seeded": 0, "message": "插件或码率优先洗版未启用"}
@@ -997,30 +1045,38 @@ class BitrateSelector(_PluginBase):
         if not subscriptions:
             return {"success": True, "seeded": 0, "message": "没有需要播种的洗版订阅"}
         changed = 0
+        corrected_total = 0
         matched = 0
         for subscribe in subscriptions:
-            seeded = self._seed_subscription_baseline(subscribe, root)
+            seeded, corrected = self._seed_subscription_baseline(subscribe, root)
             if seeded < 0:
                 continue
             matched += 1
             changed += seeded
-        if changed:
+            corrected_total += corrected
+        if changed or corrected_total:
             self.save_data(WASH_BASELINES_KEY, self._baselines)
         logger.info(
-            f"码率优选：库内基线播种完成，补种 {changed} 集（匹配 {matched}/{len(subscriptions)} 个订阅）"
+            f"码率优选：库内基线播种完成，补种 {changed} 集、校正 {corrected_total} 集"
+            f"（匹配 {matched}/{len(subscriptions)} 个订阅）"
         )
         return {
             "success": True,
             "seeded": changed,
+            "corrected": corrected_total,
             "matched_subscriptions": matched,
             "total_subscriptions": len(subscriptions),
         }
 
-    def _seed_subscription_baseline(self, subscribe: Any, root: Path) -> int:
+    def _seed_subscription_baseline(self, subscribe: Any, root: Path) -> Tuple[int, int]:
         """
-        为单个洗版订阅按库内 mediainfo 播种缺失的每集基线。
+        为单个洗版订阅按库内 mediainfo 播种或校正每集基线。
 
-        :return: 补种集数；库内未找到对应目录时返回 -1
+        缺失基线的集直接补种实测值；已有基线与库内实测倍差超过
+        WASH_BASELINE_MAX_DIVERGENCE 时以实测覆盖，修复下载提交时
+        因集数解析不全导致的估算虚高，以及版本升级后的陈旧低基线。
+
+        :return: (补种集数, 校正集数)；库内未找到对应目录时返回 (-1, -1)
         """
         name = str(getattr(subscribe, "name", "") or "")
         year = getattr(subscribe, "year", None)
@@ -1041,22 +1097,32 @@ class BitrateSelector(_PluginBase):
         entry = self._baselines.setdefault(key, {})
         episode_map = entry.setdefault("episodes", {})
         seeded = 0
+        corrected = 0
         for info_path in sorted(season_dir.glob("*-mediainfo.json")):
             episode_number = self._episode_from_filename(info_path.name)
             if not episode_number:
                 continue
-            if episode_map.get(str(episode_number)) is not None:
-                continue
             bitrate = self._mediainfo_bitrate_mbps(info_path)
             if bitrate is None:
                 continue
-            episode_map[str(episode_number)] = bitrate
-            seeded += 1
+            existing = episode_map.get(str(episode_number))
+            if existing is None:
+                episode_map[str(episode_number)] = bitrate
+                seeded += 1
+            elif self._baseline_diverged(existing, bitrate):
+                episode_map[str(episode_number)] = bitrate
+                corrected += 1
+        if corrected:
+            logger.warning(
+                f"码率优选：库内播种 {key} 校正 {corrected} 集基线为实测值"
+                f"（{show_dir.name}），原值与库内实测倍差超过 "
+                f"{WASH_BASELINE_MAX_DIVERGENCE:g} 倍"
+            )
         if seeded:
             logger.info(
                 f"码率优选：库内播种 {key} 补种 {seeded} 集实测基线（{show_dir.name}）"
             )
-        return seeded
+        return seeded, corrected
 
     def _find_show_dir(self, root: Path, name: str, year: Any) -> Optional[Path]:
         """在媒体库根目录有限深度内按「剧名 (年份)」匹配剧集目录。"""
