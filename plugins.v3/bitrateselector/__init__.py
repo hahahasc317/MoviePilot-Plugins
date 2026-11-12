@@ -25,6 +25,8 @@ RUNTIME_CACHE_TTL_SECONDS = 6 * 3600
 WASH_BASELINES_KEY = "wash_baselines"
 # 洗版基线与库内实测/既有值之间的最大合理倍差，超出视为异常需校正或拒绝记录
 WASH_BASELINE_MAX_DIVERGENCE = 2.0
+# 基线被拒绝覆盖期间的准入垫高下限存活时间（秒），超时失效防错误估算长期锁死洗版
+WASH_FLOOR_TTL_SECONDS = 48 * 3600
 # 洗版基线默认的媒体库根目录（STRM 库挂载点）
 DEFAULT_LIBRARY_ROOT = "/media"
 # 低码巡检触发订阅搜索的节流时间（秒）
@@ -51,7 +53,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.9"
+    plugin_version = "1.3.0"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -552,16 +554,18 @@ class BitrateSelector(_PluginBase):
                 return original(subscribe, context, priority)
             baseline_source = str(baseline_entry.get("full_source") or "measured")
             effective_margin = margin * 2 if candidate_source != baseline_source else margin
-            if candidate_mbps > float(baseline) * (1 + effective_margin):
+            floor = self._floor_value(baseline_entry.get("full_floor"))
+            effective_baseline = max(float(baseline), floor) if floor else float(baseline)
+            if candidate_mbps > effective_baseline * (1 + effective_margin):
                 logger.info(
                     f"码率优选：全集洗版准入 {candidate_mbps:.1f}Mbps 超过基线 "
-                    f"{float(baseline):.1f}Mbps（需 +{effective_margin:.0%}，"
+                    f"{effective_baseline:.1f}Mbps（需 +{effective_margin:.0%}，"
                     f"时长来源 候选={candidate_source}/基线={baseline_source}）"
                 )
                 return True
             logger.debug(
                 f"码率优选：全集洗版候选 {candidate_mbps:.1f}Mbps 未超基线 "
-                f"{float(baseline):.1f}Mbps（需 +{margin:.0%}），拒绝"
+                f"{effective_baseline:.1f}Mbps（需 +{margin:.0%}），拒绝"
             )
             return False
         interested = self._wash_interested_episodes(subscribe, context, margin)
@@ -584,6 +588,8 @@ class BitrateSelector(_PluginBase):
         缺基线的集区分处理：库内未下载的集是待补缺的新集，按初始下载放行；
         已下载但缺基线的集（播种遗漏）仍跳过，待库内播种补齐基线后再比较。
         标题解析出明确集数边界时，待补/待洗范围先限定在候选包自身集数内。
+        基线被拒绝覆盖的集带有按提交估算垫高的准入下限（48 小时内有效），
+        比较取基线与下限的较大者，防止播种校正窗口内低码变体再洗入覆盖。
         """
         target_episodes = set(subscription_priority.get_best_version_target_episodes(subscribe))
         if not target_episodes:
@@ -605,6 +611,7 @@ class BitrateSelector(_PluginBase):
             return None
         episode_baselines = self._wash_baseline_entry(subscribe).get("episodes") or {}
         baseline_sources = self._wash_baseline_entry(subscribe).get("ep_sources") or {}
+        episode_floors = self._wash_baseline_entry(subscribe).get("ep_floors") or {}
         if not episode_baselines:
             logger.info(
                 "码率优选：订阅尚无任何已入库集码率基线，"
@@ -621,6 +628,18 @@ class BitrateSelector(_PluginBase):
             return candidate_mbps / (1 + effective)
 
         title = (getattr(context.torrent_info, "title", "") or "")[:60]
+        floor_blocked: List[int] = []
+
+        def _admit_by_baseline(episode: int, threshold: float) -> bool:
+            """按基线与垫高下限的较大值判断该集是否仍值得洗版。"""
+            if not float(episode_baselines[str(episode)]) < threshold:
+                return False
+            floor = self._floor_value(episode_floors.get(str(episode)))
+            if floor is not None and floor >= threshold:
+                floor_blocked.append(episode)
+                return False
+            return True
+
         if not selected_episodes:
             missing = [
                 episode
@@ -641,8 +660,10 @@ class BitrateSelector(_PluginBase):
                 episode
                 for episode in target_episodes
                 if (baseline := episode_baselines.get(str(episode))) is not None
-                and float(baseline)
-                < _threshold_for(str(baseline_sources.get(str(episode), "measured")))
+                and _admit_by_baseline(
+                    episode,
+                    _threshold_for(str(baseline_sources.get(str(episode), "measured"))),
+                )
             ]
             interested = sorted(set(washable) | set(pending_new))
         else:
@@ -663,8 +684,9 @@ class BitrateSelector(_PluginBase):
                     else:
                         pending_new.append(episode_num)
                     continue
-                if float(baseline) < _threshold_for(
-                    str(baseline_sources.get(str(episode_num), "measured"))
+                if _admit_by_baseline(
+                    episode_num,
+                    _threshold_for(str(baseline_sources.get(str(episode_num), "measured"))),
                 ):
                     interested.append(episode_num)
             if skipped_known:
@@ -687,6 +709,11 @@ class BitrateSelector(_PluginBase):
         else:
             logger.debug(
                 f"码率优选：分集洗版候选 {candidate_mbps:.1f}Mbps 无可提升剧集，拒绝（{title}）"
+            )
+        if floor_blocked:
+            logger.info(
+                f"码率优选：{self._compress_episode_ranges(floor_blocked)} 命中垫高准入下限，"
+                f"候选 {candidate_mbps:.1f}Mbps 未超已提交估算，拒绝防同集降级（{title}）"
             )
         return interested
 
@@ -741,6 +768,9 @@ class BitrateSelector(_PluginBase):
         估算值与同集既有基线倍差超过 WASH_BASELINE_MAX_DIVERGENCE 时拒绝
         覆盖并告警：整季包集数解析不全会让估算虚高数倍，直接覆盖会把
         洗版准入门槛抬到不可达；被拒集保留既有值，待库内播种按实测校正。
+        向上被拒（提交估算明显高于既有基线）的集同时按提交估算垫高准入下限
+        （取历史最高，48 小时内有效）：播种校正前旧低基线仍会放行同集候选，
+        下限用于阻止更低码变体反向覆盖刚下载的高码版。
         """
         ctx = data.context
         meta = ctx.meta_info
@@ -768,9 +798,13 @@ class BitrateSelector(_PluginBase):
             entry = self._baselines.setdefault(key, {})
             new_value = round(bitrate, 2)
             refused: List[str] = []
+            refused_eps: Set[int] = set()
+            floored: List[int] = []
+            floored_full = False
             if episodes:
                 episode_map = entry.setdefault("episodes", {})
                 source_map = entry.setdefault("ep_sources", {})
+                floor_map = entry.setdefault("ep_floors", {})
                 for episode in sorted(episodes):
                     ep_key = str(episode)
                     existing = episode_map.get(ep_key)
@@ -780,18 +814,32 @@ class BitrateSelector(_PluginBase):
                         refused.append(
                             f"E{episode}（新估算 {new_value:.2f} / 既有 {float(existing):.2f}）"
                         )
+                        refused_eps.add(episode)
+                        if new_value > float(existing):
+                            floor = self._floor_value(floor_map.get(ep_key))
+                            floor_map[ep_key] = [
+                                max(new_value, floor or 0.0),
+                                time.time(),
+                            ]
+                            floored.append(episode)
                         continue
                     episode_map[ep_key] = new_value
                     source_map[ep_key] = duration_source
+                    floor_map.pop(ep_key, None)
             else:
                 existing = entry.get("full")
                 if existing is not None and self._baseline_diverged(existing, new_value):
                     refused.append(
                         f"全集（新估算 {new_value:.2f} / 既有 {float(existing):.2f}）"
                     )
+                    if new_value > float(existing):
+                        floor = self._floor_value(entry.get("full_floor"))
+                        entry["full_floor"] = [max(new_value, floor or 0.0), time.time()]
+                        floored_full = True
                 else:
                     entry["full"] = new_value
                     entry["full_source"] = duration_source
+                    entry.pop("full_floor", None)
             self.save_data(WASH_BASELINES_KEY, self._baselines)
         except Exception as err:
             logger.error(f"码率优选：保存码率基线失败：{err}")
@@ -803,11 +851,29 @@ class BitrateSelector(_PluginBase):
                 f"（倍差超过 {WASH_BASELINE_MAX_DIVERGENCE:g} 倍，"
                 "保留既有基线，待库内播种按实测校正）"
             )
-        logger.info(
-            f"码率优选：记录洗版码率基线 {key} "
-            f"{sorted(episodes) if episodes else '全集'} => {bitrate:.2f}Mbps"
-            f"（时长来源={duration_source}）"
-        )
+        if floored:
+            logger.info(
+                f"码率优选：{key} {self._compress_episode_ranges(floored)} 基线覆盖被拒，"
+                f"按提交估算 {new_value:.2f}Mbps 垫高准入下限防同集降级"
+                f"（{WASH_FLOOR_TTL_SECONDS // 3600} 小时内或库内播种实测后失效）"
+            )
+        if floored_full:
+            logger.info(
+                f"码率优选：{key} 全集基线覆盖被拒，按提交估算 {new_value:.2f}Mbps "
+                f"垫高全集准入下限防降级（{WASH_FLOOR_TTL_SECONDS // 3600} 小时后失效）"
+            )
+        if episodes:
+            accepted = sorted(episodes - refused_eps)
+            if accepted:
+                logger.info(
+                    f"码率优选：记录洗版码率基线 {key} {accepted} => {new_value:.2f}Mbps"
+                    f"（时长来源={duration_source}）"
+                )
+        elif not refused:
+            logger.info(
+                f"码率优选：记录洗版码率基线 {key} 全集 => {new_value:.2f}Mbps"
+                f"（时长来源={duration_source}）"
+            )
 
     @staticmethod
     def _baseline_diverged(existing: Any, candidate: float) -> bool:
@@ -822,6 +888,19 @@ class BitrateSelector(_PluginBase):
             candidate > old * WASH_BASELINE_MAX_DIVERGENCE
             or candidate < old / WASH_BASELINE_MAX_DIVERGENCE
         )
+
+    @staticmethod
+    def _floor_value(raw: Any) -> Optional[float]:
+        """解析垫高准入下限记录，返回未过期的码率值；损坏或已过期返回 None。"""
+        if isinstance(raw, (list, tuple)) and len(raw) == 2:
+            try:
+                value = float(raw[0])
+                ts = float(raw[1])
+            except (TypeError, ValueError):
+                return None
+            if value > 0 and 0 <= time.time() - ts <= WASH_FLOOR_TTL_SECONDS:
+                return value
+        return None
 
     def _safe_seed_baselines(self) -> Dict[str, Any]:
         """执行库内播种并吞掉异常，返回结果摘要。"""
@@ -1075,6 +1154,8 @@ class BitrateSelector(_PluginBase):
         缺失基线的集直接补种实测值；已有基线与库内实测倍差超过
         WASH_BASELINE_MAX_DIVERGENCE 时以实测覆盖，修复下载提交时
         因集数解析不全导致的估算虚高，以及版本升级后的陈旧低基线。
+        取得实测值的集同时清除其垫高准入下限：实测基线接管防降级职责后，
+        陈旧下限（尤其是错误虚高的估算）不应继续压制后续正常洗版。
 
         :return: (补种集数, 校正集数)；库内未找到对应目录时返回 (-1, -1)
         """
@@ -1096,6 +1177,7 @@ class BitrateSelector(_PluginBase):
             return -1, -1
         entry = self._baselines.setdefault(key, {})
         episode_map = entry.setdefault("episodes", {})
+        floor_map = entry.setdefault("ep_floors", {})
         seeded = 0
         corrected = 0
         for info_path in sorted(season_dir.glob("*-mediainfo.json")):
@@ -1108,10 +1190,14 @@ class BitrateSelector(_PluginBase):
             existing = episode_map.get(str(episode_number))
             if existing is None:
                 episode_map[str(episode_number)] = bitrate
+                floor_map.pop(str(episode_number), None)
                 seeded += 1
             elif self._baseline_diverged(existing, bitrate):
                 episode_map[str(episode_number)] = bitrate
+                floor_map.pop(str(episode_number), None)
                 corrected += 1
+            else:
+                floor_map.pop(str(episode_number), None)
         if corrected:
             logger.warning(
                 f"码率优选：库内播种 {key} 校正 {corrected} 集基线为实测值"
