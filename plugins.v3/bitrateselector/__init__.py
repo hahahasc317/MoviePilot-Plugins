@@ -3,6 +3,7 @@ import json
 import re
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -53,7 +54,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -955,6 +956,7 @@ class BitrateSelector(_PluginBase):
         root = Path(self._library_root)
         if not root.is_dir():
             return result
+        stale_skipped = 0
         for info_path in root.rglob("*-mediainfo.json"):
             try:
                 if info_path.stat().st_mtime < cutoff:
@@ -964,6 +966,21 @@ class BitrateSelector(_PluginBase):
             bitrate = self._mediainfo_bitrate_mbps(info_path)
             if bitrate is None or bitrate >= self._inspect_min_mbps:
                 continue
+            # 边车码率低于门槛时，用同名 strm 的 115 实际文件大小复核，
+            # 排除洗版入库后 mediainfo 边车未刷新导致的假低码通报与重复触发搜索
+            has_strm, remote_size = self._strm_remote_size(info_path)
+            if not has_strm:
+                # 无同名 strm 说明该边车是换版残留，不代表当前生效版本
+                stale_skipped += 1
+                continue
+            if remote_size:
+                runtime_seconds = self._mediainfo_runtime_seconds(info_path)
+                if runtime_seconds:
+                    actual_bitrate = remote_size * 8 / runtime_seconds / 1_000_000
+                    if actual_bitrate >= self._inspect_min_mbps:
+                        stale_skipped += 1
+                        continue
+                    bitrate = round(actual_bitrate, 2)
             season_dir = info_path.parent
             show_dir = season_dir.parent
             season_match = re.search(r"[Ss]eason\s*(\d+)", season_dir.name)
@@ -978,6 +995,10 @@ class BitrateSelector(_PluginBase):
                 entry["eps"].setdefault(episode_number, []).append(rate)
             else:
                 entry["unknown"].append((info_path.stem[:20], rate))
+        if stale_skipped:
+            logger.info(
+                f"码率优选：低码巡检复核 strm 实际大小，跳过 {stale_skipped} 个已换版/无 strm 的过期边车条目"
+            )
         return result
 
     @staticmethod
@@ -1277,6 +1298,43 @@ class BitrateSelector(_PluginBase):
                 if size and ticks:
                     bitrate = int(size * 8 / (ticks / 10_000_000))
             return round(bitrate / 1_000_000, 2) if bitrate else None
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            return None
+
+    @staticmethod
+    def _strm_remote_size(info_path: Path) -> Tuple[bool, Optional[int]]:
+        """
+        读取同名 .strm 指向的 115 直链实际文件大小（字节）。
+
+        :return: (是否存在同名 strm, 实际大小；无 strm 或获取失败时大小为 None)
+        """
+        strm_path = info_path.with_name(
+            info_path.name[: -len("-mediainfo.json")] + ".strm"
+        )
+        try:
+            url = strm_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False, None
+        if not url:
+            return True, None
+        try:
+            request = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(request, timeout=8) as response:
+                length = response.headers.get("Content-Length")
+            return True, int(length) if length else None
+        except Exception as err:
+            logger.debug(
+                f"码率优选：strm 实际大小获取失败（{strm_path.name}）：{err}"
+            )
+            return True, None
+
+    @staticmethod
+    def _mediainfo_runtime_seconds(path: Path) -> Optional[float]:
+        """读取 mediainfo 中媒体运行时长（秒），用于按实际文件大小估算码率。"""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            ticks = float(data[0]["MediaSourceInfo"].get("RunTimeTicks") or 0)
+            return ticks / 10_000_000 if ticks > 0 else None
         except (OSError, ValueError, KeyError, IndexError, TypeError):
             return None
 
