@@ -16,6 +16,11 @@ DATA_BLOCKS_KEY = "recent_blocks"
 SOURCE_TTL_DAYS = 30
 NOTIFY_DEBOUNCE_SECONDS = 30
 BLOCKS_CAP = 50
+# 下载历史来源查询结果的缓存时长（秒），避免整理时每个文件都查一次数据库
+HISTORY_LOOKUP_TTL = 600
+# 选种阶段处理优先级：须早于码率优选（默认 10），先剔除非正片候选再比码率，
+# 否则高码的加更包可能先把同集干净的正片版本淘汰掉
+SELECTION_PRIORITY = 5
 
 
 class VarietyPurifier(_PluginBase):
@@ -28,7 +33,7 @@ class VarietyPurifier(_PluginBase):
         "被拦文件保留在下载目录不影响做种。"
     )
     plugin_icon = ""
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "varietypurifier_"
     plugin_order = 16
@@ -47,10 +52,12 @@ class VarietyPurifier(_PluginBase):
     _notify_buffer: List[str] = []
     _notify_timer: Optional[threading.Timer] = None
     _notify_lock = threading.Lock()
+    _history_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态，并回填近期下载来源。"""
         self._notify_buffer = []
+        self._history_cache = {}
         if self._notify_timer is not None:
             self._notify_timer.cancel()
             self._notify_timer = None
@@ -331,6 +338,62 @@ class VarietyPurifier(_PluginBase):
         except Exception as err:
             logger.error(f"综艺正片净化：整理拦截处理失败：{err}")
 
+    @eventmanager.register(ChainEventType.ResourceSelection, priority=SELECTION_PRIORITY)
+    def on_resource_selection(self, event: Event = None) -> None:
+        """选种阶段剔除命中非正片标记的综艺候选，让干净的正片版本参与后续优选。"""
+        if not self._enabled or not self._block_download:
+            return
+        try:
+            data = getattr(event, "event_data", None)
+            if data is None:
+                return
+            if self._exempt_manual and str(getattr(data, "origin", "") or "") == "Manual":
+                return
+            if getattr(data, "updated", False) and getattr(data, "updated_contexts", None) is not None:
+                contexts = list(data.updated_contexts)
+            else:
+                contexts = list(getattr(data, "contexts", None) or [])
+            if not contexts:
+                return
+            kept = []
+            dropped = []
+            for context in contexts:
+                keyword = self._non_feature_keyword(context)
+                if keyword:
+                    title = str(getattr(getattr(context, "torrent_info", None), "title", "") or "")
+                    dropped.append((title, keyword))
+                else:
+                    kept.append(context)
+            if not dropped:
+                return
+            data.updated = True
+            data.updated_contexts = kept
+            data.source = "综艺正片净化"
+            for title, keyword in dropped:
+                logger.info(f"综艺正片净化：选种剔除 {title}（命中 {keyword}）")
+                self._record_block(title, f"选种剔除：命中 {keyword}")
+        except Exception as err:
+            logger.error(f"综艺正片净化：选种过滤处理失败：{err}")
+
+    def _non_feature_keyword(self, context: Any) -> Optional[str]:
+        """判断候选是否为范围内综艺且标题/副标题命中非正片标记，返回命中的关键词。"""
+        torrent_info = getattr(context, "torrent_info", None)
+        mediainfo = getattr(context, "media_info", None)
+        if torrent_info is None or mediainfo is None:
+            return None
+        if self._media_type_str(mediainfo) != "电视剧":
+            return None
+        category = str(
+            getattr(mediainfo, "library_category", "")
+            or getattr(mediainfo, "category", "")
+            or ""
+        )
+        if self._scope_variety_only and "综艺" not in category:
+            return None
+        title = str(getattr(torrent_info, "title", "") or "")
+        description = str(getattr(torrent_info, "description", "") or "")
+        return match_keyword(f"{title} {description}".strip(), self._keywords)
+
     @eventmanager.register(ChainEventType.ResourceDownload)
     def on_resource_download(self, event: Event = None) -> None:
         """下载提交前裁决：非手动来源的综艺种子命中非正片标记时整包拒收。"""
@@ -343,24 +406,10 @@ class VarietyPurifier(_PluginBase):
             if self._exempt_manual and str(getattr(data, "origin", "") or "") == "Manual":
                 return
             context = getattr(data, "context", None)
-            torrent_info = getattr(context, "torrent_info", None)
-            mediainfo = getattr(context, "media_info", None)
-            if torrent_info is None or mediainfo is None:
-                return
-            if self._media_type_str(mediainfo) != "电视剧":
-                return
-            category = str(
-                getattr(mediainfo, "library_category", "")
-                or getattr(mediainfo, "category", "")
-                or ""
-            )
-            if self._scope_variety_only and "综艺" not in category:
-                return
-            title = str(getattr(torrent_info, "title", "") or "")
-            description = str(getattr(torrent_info, "description", "") or "")
-            keyword = match_keyword(f"{title} {description}".strip(), self._keywords)
+            keyword = self._non_feature_keyword(context)
             if not keyword:
                 return
+            title = str(getattr(getattr(context, "torrent_info", None), "title", "") or "")
             data.cancel = True
             data.source = "综艺正片净化"
             data.reason = f"种子含非正片内容（命中 {keyword}），整包拒收"
@@ -385,7 +434,13 @@ class VarietyPurifier(_PluginBase):
             entry = self._torrent_sources.get(directory)
             if entry is not None:
                 return bool(entry.get("manual"))
-        history_manual = self._lookup_source_from_history(path)
+        cache_key = directory or path
+        cached = self._history_cache.get(cache_key)
+        if cached is not None and time.time() - cached[0] < HISTORY_LOOKUP_TTL:
+            history_manual = cached[1]
+        else:
+            history_manual = self._lookup_source_from_history(path)
+            self._history_cache[cache_key] = (time.time(), history_manual)
         if history_manual is not None:
             return history_manual
         # 未知来源按订阅处理（过滤生效是安全方向）

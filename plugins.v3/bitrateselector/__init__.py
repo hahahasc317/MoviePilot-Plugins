@@ -77,7 +77,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -455,12 +455,17 @@ class BitrateSelector(_PluginBase):
         if not self._enabled:
             return
         data = event.event_data
-        if not isinstance(data, ResourceSelectionEventData) or not data.contexts:
+        if not isinstance(data, ResourceSelectionEventData):
+            return
+        # 链式事件中前序插件（如综艺正片净化）可能已改写候选，须在其结果上继续筛选
+        if data.updated and data.updated_contexts is not None:
+            contexts = list(data.updated_contexts)
+        else:
+            contexts = list(data.contexts or [])
+        if not contexts:
             return
         try:
-            kept, dropped_logs, dropped_notices = self._drop_dominated_candidates(
-                list(data.contexts)
-            )
+            kept, dropped_logs, dropped_notices = self._drop_dominated_candidates(contexts)
         except Exception as err:
             logger.error(f"码率优选：处理候选列表失败：{err}")
             return

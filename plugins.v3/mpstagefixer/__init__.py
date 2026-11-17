@@ -14,6 +14,12 @@ REPORT_KEY = "last_report"
 REVIEW_KEY = "last_review_report"
 DEFAULT_REVIEW_CRON = "*/30 * * * *"
 QUICK_DELAY_SECONDS = 420  # 须大于 stagefix.STAGE_MIN_AGE，否则定向复查会把新残留当新鲜对象跳过
+# 扫描锁被占用时定向复查的重排间隔与最多重排次数
+QUICK_RETRY_SECONDS = 300
+QUICK_MAX_RETRIES = 3
+# 同一错误告警的去重间隔
+ERROR_ALERT_INTERVAL = 24 * 3600
+ERROR_ALERT_KEY = "last_error_alert"
 RUN_LOCK = threading.Lock()
 REVIEW_LOCK = threading.Lock()
 
@@ -28,7 +34,7 @@ class MPStageFixer(_PluginBase):
         "定时核验 durable 整理待复核任务，仅对目标可证实的步骤自动判定 applied。"
     )
     plugin_icon = ""
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.0"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "mpstagefixer_"
     plugin_order = 15
@@ -391,18 +397,34 @@ class MPStageFixer(_PluginBase):
         if action != "mpstage_fix":
             return
         threading.Thread(
-            target=self._run_sweep,
+            target=self._safe_sweep,
             kwargs={"source": "manual"},
             name="mpstagefixer-manual",
             daemon=True,
         ).start()
 
-    def _safe_sweep(self) -> None:
-        """定时全量扫描入口，吞掉异常避免影响调度器。"""
+    def _safe_sweep(self, source: str = "sweep") -> None:
+        """全量扫描入口：吞掉异常避免影响调度器，并对失败（如 cookie 失效）告警。"""
         try:
-            self._run_sweep(source="sweep")
+            self._run_sweep(source=source)
         except Exception as err:
-            logger.error(f"MPStageFixer：定时扫描失败：{err}")
+            logger.error(f"MPStageFixer：全量扫描失败：{err}")
+            self._alert_error("全量扫描失败", err, force=source == "manual")
+
+    def _alert_error(self, title: str, err: Exception, force: bool = False) -> None:
+        """同一错误 24 小时内只通知一次；手动触发时总是通知。"""
+        if not self._notify:
+            return
+        message = f"{type(err).__name__}: {err}"[:300]
+        last = self.get_data(ERROR_ALERT_KEY) or {}
+        import time as _time
+
+        now = _time.time()
+        if not force and last.get("message") == message and now - float(last.get("ts", 0)) < ERROR_ALERT_INTERVAL:
+            return
+        self.save_data(ERROR_ALERT_KEY, {"message": message, "ts": now})
+        hint = "（可能是 P115Disk 的 115 cookie 失效）" if "cookie" in message.lower() else ""
+        self.post_message(mtype=None, title=f"MP暂存残留修复：{title}", text=f"{message}{hint}")
 
     def _safe_review(self) -> None:
         """定时待复核判定入口，吞掉异常避免影响调度器。"""
@@ -477,12 +499,18 @@ class MPStageFixer(_PluginBase):
             }
             client = stagefix.make_client()
             root_cid = stagefix.library_root_cid(client)
-            findings, visited = stagefix.walk(client, root_cid, self._max_dirs)
+            findings, visited, aborted = stagefix.walk(client, root_cid, self._max_dirs)
             report["visited"] = visited
             report["findings"] = len(findings)
+            report["aborted"] = aborted or ""
             for finding in findings:
                 logger.info(f"MPStageFixer：发现残留 {finding['path']} ({finding['size']} 字节)")
-                result, detail = stagefix.fix_one(client, finding)
+                try:
+                    result, detail = stagefix.fix_one(client, finding)
+                except stagefix.StageRateLimited as err:
+                    report["aborted"] = "115 限流"
+                    logger.warning(f"MPStageFixer：修复中遇 115 限流，本轮中止：{err}")
+                    break
                 report[result] = report.get(result, 0) + 1
                 report["details"].append(f"[{result}] {finding['path']} → {detail}")
                 if result == "fixed":
@@ -494,17 +522,33 @@ class MPStageFixer(_PluginBase):
                 report["orphan_deleted"] = o_deleted
                 report["orphan_guard"] = o_guard
                 report["orphan_braked"] = o_braked
-            self._save_and_notify(report)
+            # 定时扫描只在有修复结果/异常时通知；手动触发总是回报
+            self._save_and_notify(report, always=source == "manual")
             return report
         finally:
             RUN_LOCK.release()
 
-    def _run_quick_check(self, dir_path: str) -> None:
-        """定向复查单个网盘目录并修复其中的暂存残留。"""
+    def _run_quick_check(self, dir_path: str, retries: int = 0) -> None:
+        """定向复查单个网盘目录并修复其中的暂存残留；扫描占用时稍后重排。"""
         if not self._enabled:
             return
         if not RUN_LOCK.acquire(blocking=False):
-            logger.info(f"MPStageFixer：扫描任务占用中，定向复查稍后由定时扫描覆盖：{dir_path}")
+            if retries >= QUICK_MAX_RETRIES:
+                logger.info(f"MPStageFixer：扫描任务持续占用，定向复查交由定时扫描覆盖：{dir_path}")
+                return
+            try:
+                job_id = "quick-" + hashlib.md5(dir_path.encode("utf-8")).hexdigest()[:12] + f"-r{retries + 1}"
+                add_plugin_once_job(
+                    self.__class__.__name__,
+                    job_id,
+                    self._run_quick_check,
+                    name="mp-stage 定向复查（重排）",
+                    delay_seconds=QUICK_RETRY_SECONDS,
+                    func_kwargs={"dir_path": dir_path, "retries": retries + 1},
+                )
+                logger.info(f"MPStageFixer：扫描任务占用中，{QUICK_RETRY_SECONDS}s 后重试定向复查：{dir_path}")
+            except Exception as err:
+                logger.error(f"MPStageFixer：定向复查重排失败：{err}")
             return
         try:
             from . import stagefix
@@ -535,8 +579,11 @@ class MPStageFixer(_PluginBase):
                 report[result] = report.get(result, 0) + 1
                 report["details"].append(f"[{result}] {finding['path']} → {detail}")
             self._save_and_notify(report, always=False)
+        except stagefix.StageRateLimited as err:
+            logger.warning(f"MPStageFixer：定向复查遇 115 限流，交由定时扫描覆盖 {dir_path}：{err}")
         except Exception as err:
             logger.error(f"MPStageFixer：定向复查失败 {dir_path}：{err}")
+            self._alert_error("定向复查失败", err)
         finally:
             RUN_LOCK.release()
 
@@ -555,7 +602,7 @@ class MPStageFixer(_PluginBase):
             + report.get("failed", 0)
             + report.get("manual", 0)
         )
-        if report.get("orphan_braked"):
+        if report.get("orphan_braked") or report.get("aborted"):
             interesting += 1
         if not always and interesting <= 0:
             return
@@ -566,6 +613,8 @@ class MPStageFixer(_PluginBase):
             f"　需人工：{report.get('manual', 0)}",
         ]
         details = report.get("details") or []
+        if report.get("aborted"):
+            lines.append(f"本轮扫描已中止：{report['aborted']}，下轮自动继续")
         if report.get("orphan_braked"):
             lines.append("孤儿边车候选数量异常，已刹车未删除，请检查 strm 是否缺失")
         if details:

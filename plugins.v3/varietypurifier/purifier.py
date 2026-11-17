@@ -51,6 +51,28 @@ def is_subscribe_source(source: Optional[str]) -> bool:
     return bool(source) and str(source).startswith(SUBSCRIBE_SOURCE_PREFIX)
 
 
+_KEYWORD_PATTERN_CACHE: dict = {}
+
+
+def _keyword_pattern(keyword: str) -> "re.Pattern[str]":
+    """把关键词编译为匹配正则。
+
+    纯英文关键词按单词边界匹配，词内的 . 空格 _ - 互相通配，避免 Pure 误伤
+    Impure/Purely、Watch 误伤 Stopwatch；含中文的关键词仍按子串匹配。
+    """
+    cached = _KEYWORD_PATTERN_CACHE.get(keyword)
+    if cached is not None:
+        return cached
+    if keyword.isascii():
+        parts = [re.escape(part) for part in re.split(r"[.\s_\-]+", keyword) if part]
+        body = r"[.\s_\-]?".join(parts)
+        pattern = re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z])", re.IGNORECASE)
+    else:
+        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+    _KEYWORD_PATTERN_CACHE[keyword] = pattern
+    return pattern
+
+
 def match_keyword(text: str, keywords: tuple[str, ...]) -> Optional[str]:
     """在文本中查找命中的拦截关键词。
 
@@ -58,9 +80,8 @@ def match_keyword(text: str, keywords: tuple[str, ...]) -> Optional[str]:
     :param keywords: 拦截关键词元组
     :return: 命中的第一个关键词；未命中返回 None
     """
-    lowered = text.lower()
     for keyword in keywords:
-        if keyword and keyword.lower() in lowered:
+        if keyword and _keyword_pattern(keyword).search(text or ""):
             return keyword
     return None
 

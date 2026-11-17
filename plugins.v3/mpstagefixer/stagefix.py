@@ -85,29 +85,91 @@ def library_root_cid(client: P115Client) -> int:
     raise RuntimeError("115 根目录下未找到「最近接收」")
 
 
-def walk(client: P115Client, root_cid: int, max_dirs: int = 3000) -> Tuple[List[dict], int]:
-    """广度优先遍历媒体库，返回 (残留清单, 已扫描目录数)。"""
+class StageRateLimited(RuntimeError):
+    """115 接口被限流，本轮扫描熔断。"""
+
+
+# 115 限流特征（小写匹配）
+RATE_LIMIT_MARKERS = ("770004", "限流", "rate limit", "too many request", "访问频繁", "请求频繁")
+# 列目录分页大小与连续失败熔断阈值
+LIST_PAGE_SIZE = 1000
+MAX_CONSECUTIVE_FAILURES = 3
+
+
+def _is_rate_limited(text: str) -> bool:
+    """判断错误信息是否为限流。"""
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in RATE_LIMIT_MARKERS)
+
+
+def list_dir(client: P115Client, cid: int) -> List[dict]:
+    """分页列出目录全部直接子项；限流抛 StageRateLimited，其他失败抛 RuntimeError。
+
+    超过 1000 项的目录也能完整列出，避免漏扫残留或误判同名正式对象不存在。
+    """
+    items: List[dict] = []
+    offset = 0
+    while True:
+        try:
+            resp = client.fs_files(
+                {"cid": cid, "limit": LIST_PAGE_SIZE, "offset": offset, "show_dir": 1}
+            )
+        except Exception as err:
+            if _is_rate_limited(str(err)):
+                raise StageRateLimited(str(err)) from err
+            raise RuntimeError(f"列目录失败: {err}") from err
+        time.sleep(0.4)  # webapi 限速保护
+        if isinstance(resp, dict) and resp.get("state") is False:
+            message = json.dumps(resp, ensure_ascii=False)[:200]
+            if _is_rate_limited(message):
+                raise StageRateLimited(message)
+            raise RuntimeError(f"列目录失败: {message}")
+        data = resp.get("data") or []
+        items.extend(data)
+        offset += len(data)
+        try:
+            total = int(resp.get("count") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if not data or len(data) < LIST_PAGE_SIZE or offset >= total:
+            break
+    return items
+
+
+def walk(client: P115Client, root_cid: int,
+         max_dirs: int = 3000) -> Tuple[List[dict], int, Optional[str]]:
+    """广度优先遍历媒体库。
+
+    :return: (残留清单, 已扫描目录数, 中止原因)；被限流或连续失败时中止本轮，原因非空
+    """
     queue: List[Tuple[str, int]] = [("/", root_cid)]
     findings: List[dict] = []
     visited = 0
+    failures = 0
     while queue and visited < max_dirs:
         path, cid = queue.pop(0)
         visited += 1
         try:
-            resp = client.fs_files({"cid": cid, "limit": 1000, "show_dir": 1})
+            items = list_dir(client, cid)
+        except StageRateLimited as err:
+            logger.warning(f"MPStageFixer：115 限流，全量扫描中止于 {path}: {err}")
+            return findings, visited, "115 限流"
         except Exception as err:
+            failures += 1
             logger.warning(f"MPStageFixer：列目录失败 {path}: {err}")
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                return findings, visited, f"连续 {failures} 次列目录失败：{err}"
             time.sleep(3)
             continue
-        time.sleep(0.4)  # webapi 限速保护
-        for item in resp.get("data") or []:
+        failures = 0
+        for item in items:
             name = item.get("n") or ""
             if item.get("fid") is None:  # 目录
                 queue.append((f"{path}/{name}", int(item["cid"])))
                 continue
             if "mp-stage" in name or "**" in name:
                 findings.append(_finding_from_item(f"{path}/{name}", cid, item))
-    return findings, visited
+    return findings, visited, None
 
 
 def resolve_dir_cid(client: P115Client, root_cid: int, dir_path: str) -> Optional[int]:
@@ -119,10 +181,8 @@ def resolve_dir_cid(client: P115Client, root_cid: int, dir_path: str) -> Optiona
     for part in rel.split("/"):
         if not part:
             continue
-        resp = client.fs_files({"cid": cid, "limit": 1000, "show_dir": 1})
-        time.sleep(0.4)
         found = None
-        for item in resp.get("data") or []:
+        for item in list_dir(client, cid):
             if item.get("fid") is None and item.get("n") == part:
                 found = int(item["cid"])
                 break
@@ -134,10 +194,8 @@ def resolve_dir_cid(client: P115Client, root_cid: int, dir_path: str) -> Optiona
 
 def scan_one_dir(client: P115Client, cid: int) -> List[dict]:
     """扫描单个目录，返回残留清单。"""
-    resp = client.fs_files({"cid": cid, "limit": 1000, "show_dir": 1})
-    time.sleep(0.4)
     findings: List[dict] = []
-    for item in resp.get("data") or []:
+    for item in list_dir(client, cid):
         name = item.get("n") or ""
         if item.get("fid") is None:
             continue
@@ -298,10 +356,11 @@ def fix_one(client: P115Client, finding: dict) -> Tuple[str, str]:
         return "manual", f"无法推断正式名: {name}"
 
     try:
-        resp = client.fs_files({"cid": finding["dir_cid"], "limit": 1000, "show_dir": 1})
+        siblings = {item.get("n"): item for item in list_dir(client, finding["dir_cid"])}
+    except StageRateLimited:
+        raise
     except Exception as err:
         return "failed", f"列目录失败: {err}"
-    siblings = {item.get("n"): item for item in resp.get("data") or []}
 
     existing = siblings.get(clean)
     if existing is not None:
@@ -338,12 +397,12 @@ def fix_one(client: P115Client, finding: dict) -> Tuple[str, str]:
             return "failed", f"秒传未成功 status={init.get('status')}: {clean}"
         time.sleep(2)
         try:
-            resp = client.fs_files({"cid": finding["dir_cid"], "limit": 1000, "show_dir": 1})
+            listing = list_dir(client, finding["dir_cid"])
+        except StageRateLimited:
+            raise
         except Exception as err:
             return "failed", f"复查列目录失败: {err}"
-        new_item = next(
-            (i for i in resp.get("data") or [] if i.get("n") == clean), None
-        )
+        new_item = next((i for i in listing if i.get("n") == clean), None)
         if not new_item or int(new_item.get("s") or 0) != finding["size"]:
             return "failed", f"新对象复核失败: {clean}"
 

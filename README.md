@@ -8,7 +8,7 @@ https://github.com/hahahasc317/MoviePilot-Plugins/raw/main/
 
 ## 插件列表
 
-### 码率优选（BitrateSelector）v1.4.0
+### 码率优选（BitrateSelector）v1.4.1
 
 下载前按「种子体积 × 8 ÷ 每集时长之和」估算候选资源码率（Mbps），自动优选高码率资源。
 
@@ -26,13 +26,13 @@ https://github.com/hahahasc317/MoviePilot-Plugins/raw/main/
 - 仅支持 MoviePilot V3（`system_version >= 3.0.0`）。
 - 「码率优先洗版」通过运行时补丁接管洗版准入与整包门槛两个核心函数。插件每次加载（包括 MoviePilot 升级重启后）自动重新替换，并每 30 分钟自检；若升级后函数签名变化，该项补丁不安装、对应功能回退核心原判定并发通知，插件详情页可看补丁状态。
 
-### MP暂存残留修复（MPStageFixer）v1.1.1
+### MP暂存残留修复（MPStageFixer）v1.2.0
 
-检测并修复 115 网盘上 CloudDrive2 / 115网盘Plus 留下的 mp-stage 暂存残留（SHA1 秒传重建），整理完成后定向复查 + 定时全量扫描；可选清理孤儿边车（单轮超 50 个自动刹车）；定时核验 durable 整理待复核任务。
+检测并修复 115 网盘上 CloudDrive2 / 115网盘Plus 留下的 mp-stage 暂存残留（SHA1 秒传重建），整理完成后定向复查 + 定时全量扫描；可选清理孤儿边车（单轮超 50 个自动刹车）；定时核验 durable 整理待复核任务。定时扫描只在有修复结果或异常时通知，115 限流自动熔断。
 
-### 综艺正片净化（VarietyPurifier）v1.1.0
+### 综艺正片净化（VarietyPurifier）v1.2.0
 
-订阅来源的综艺：下载准入时整包拒收带加更/花絮/纯享等标记的种子，整理入库时逐文件拦截漏网的非正片与 Part 分半文件；手动下载放行。
+订阅来源的综艺只要正片：选种阶段先剔除（早于码率优选），下载准入时整包拒收带加更/花絮/纯享等标记的种子，整理入库时逐文件拦截漏网的非正片与 Part 分半文件；手动下载放行。
 
 ## 开发
 

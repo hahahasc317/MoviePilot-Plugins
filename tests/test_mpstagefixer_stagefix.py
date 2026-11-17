@@ -130,3 +130,58 @@ class OrphanSidecarTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeClient:
+    """按 offset 分页返回目录项的 115 客户端桩。"""
+
+    def __init__(self, tree, fail=None):
+        self.tree = tree
+        self.fail = fail or {}
+        self.calls = []
+
+    def fs_files(self, params):
+        self.calls.append(params)
+        cid = params["cid"]
+        if cid in self.fail:
+            error = self.fail[cid]
+            if isinstance(error, Exception):
+                raise error
+            return error
+        items = self.tree.get(cid, [])
+        offset, limit = params.get("offset", 0), params["limit"]
+        return {"state": True, "count": len(items), "data": items[offset:offset + limit]}
+
+
+class ListDirTest(unittest.TestCase):
+    def setUp(self):
+        self._sleep = stagefix.time.sleep
+        stagefix.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        stagefix.time.sleep = self._sleep
+
+    def test_paginates_large_dir(self):
+        items = [{"n": f"f{i}.mkv", "fid": i} for i in range(2500)]
+        client = _FakeClient({1: items})
+        self.assertEqual(len(stagefix.list_dir(client, 1)), 2500)
+        self.assertEqual([c["offset"] for c in client.calls], [0, 1000, 2000])
+
+    def test_rate_limit_detected(self):
+        client = _FakeClient({}, fail={1: {"state": False, "errno": 770004, "error": "访问频繁"}})
+        with self.assertRaises(stagefix.StageRateLimited):
+            stagefix.list_dir(client, 1)
+
+    def test_walk_aborts_on_rate_limit(self):
+        tree = {1: [{"n": "A", "cid": 2}, {"n": "x.mkv**.mp-stage-ab", "fid": 9, "s": 1}], 2: []}
+        client = _FakeClient(tree, fail={2: RuntimeError("errno 770004")})
+        findings, visited, aborted = stagefix.walk(client, 1)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(aborted, "115 限流")
+
+    def test_walk_aborts_after_consecutive_failures(self):
+        tree = {1: [{"n": d, "cid": c} for d, c in (("A", 2), ("B", 3), ("C", 4), ("D", 5))]}
+        client = _FakeClient(tree, fail={c: RuntimeError("boom") for c in (2, 3, 4)})
+        _, visited, aborted = stagefix.walk(client, 1)
+        self.assertEqual(visited, 4)
+        self.assertIn("连续 3 次", aborted)
