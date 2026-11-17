@@ -242,18 +242,47 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class NoticeDedupeTest(unittest.TestCase):
+def _notice(media="玫瑰战争 S01", drop_ver="OurTV · Vivid HDR", drop_rate=4.8,
+            keep_ver="ADWeb · HDR10", keep_rate=14.9):
+    return {"media": media, "drop_ver": drop_ver, "drop_rate": drop_rate,
+            "keep_ver": keep_ver, "keep_rate": keep_rate}
+
+
+class NoticeTest(unittest.TestCase):
     def test_same_pair_notified_once_despite_bitrate_jitter(self):
         plugin = make_plugin()
-        first = plugin._dedupe_notices(["玫瑰战争 S01：淘汰 OurTV 4.8Mbps → 保留 ADWeb 14.9Mbps"])
-        again = plugin._dedupe_notices(["玫瑰战争 S01：淘汰 OurTV 4.8Mbps → 保留 ADWeb 14.8Mbps"])
-        other = plugin._dedupe_notices(["折月亮 S01：淘汰 A 3.0Mbps → 保留 B 9.0Mbps"])
-        self.assertEqual(len(first), 1)
-        self.assertEqual(again, [])
-        self.assertEqual(len(other), 1)
+        self.assertEqual(len(plugin._dedupe_notices([_notice()])), 1)
+        self.assertEqual(plugin._dedupe_notices([_notice(keep_rate=14.8)]), [])
+        self.assertEqual(len(plugin._dedupe_notices([_notice(media="折月亮 S01")])), 1)
 
     def test_expired_entry_notifies_again(self):
         plugin = make_plugin()
-        key = "玫瑰战争 S01：淘汰 OurTV  → 保留 ADWeb "
+        key = "玫瑰战争 S01|OurTV · Vivid HDR|ADWeb · HDR10"
         plugin.save_data(bs.SELECTION_NOTICE_KEY, {key: time.time() - bs.SELECTION_NOTICE_TTL_SECONDS - 1})
-        self.assertEqual(len(plugin._dedupe_notices(["玫瑰战争 S01：淘汰 OurTV 4.8Mbps → 保留 ADWeb 14.9Mbps"])), 1)
+        self.assertEqual(len(plugin._dedupe_notices([_notice()])), 1)
+
+    def test_render_grouped(self):
+        text = bs.BitrateSelector._render_selection_notice([
+            _notice(), _notice(drop_ver="CHDWEB", drop_rate=7.0),
+            _notice(media="折月亮 S01", drop_ver="A", drop_rate=3.0, keep_ver="B", keep_rate=9.0),
+        ])
+        self.assertEqual(text, (
+            "玫瑰战争 S01\n"
+            "✅ 保留 ADWeb · HDR10　14.9 Mbps\n"
+            "⛔ 淘汰 OurTV · Vivid HDR　4.8 Mbps（低 68%）\n"
+            "⛔ 淘汰 CHDWEB　7.0 Mbps（低 53%）\n\n"
+            "折月亮 S01\n"
+            "✅ 保留 B　9.0 Mbps\n"
+            "⛔ 淘汰 A　3.0 Mbps（低 67%）"))
+
+    def test_effect_tokens_deduped(self):
+        self.assertEqual(bs.BitrateSelector._dedupe_effect_tokens("HDR10 HDR"), "HDR10")
+        self.assertEqual(bs.BitrateSelector._dedupe_effect_tokens("Vivid HDR"), "Vivid HDR")
+        self.assertEqual(bs.BitrateSelector._dedupe_effect_tokens("DV HDR10 HDR"), "DV HDR10")
+        label = bs.BitrateSelector._notify_version_label(
+            NS(meta_info=NS(resource_team="ADWeb", resource_effect="HDR10 HDR"), torrent_info=NS(title="x")))
+        self.assertEqual(label, "ADWeb · HDR10")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -80,7 +80,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.4.2"
+    plugin_version = "1.4.3"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -484,15 +484,15 @@ class BitrateSelector(_PluginBase):
                 self.post_message(
                     mtype=None,
                     title="码率优选",
-                    text="同覆盖低码候选已淘汰：\n" + "\n".join(fresh[:5]),
+                    text=self._render_selection_notice(fresh),
                 )
 
-    def _dedupe_notices(self, notices: List[str]) -> List[str]:
+    def _dedupe_notices(self, notices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         淘汰通知去重：同一剧集的同一组「淘汰版本 → 保留版本」24 小时内只通知一次。
 
         订阅每轮搜索都会遇到同一批候选，码率数值随时长估算小幅波动，
-        去重键忽略码率数字，只看剧集与版本标签。
+        去重键只看剧集与版本标签，不含码率。
         """
         now = time.time()
         sent: Dict[str, float] = {
@@ -500,15 +500,42 @@ class BitrateSelector(_PluginBase):
             for key, ts in (self.get_data(SELECTION_NOTICE_KEY) or {}).items()
             if now - float(ts) < SELECTION_NOTICE_TTL_SECONDS
         }
-        fresh: List[str] = []
+        fresh: List[Dict[str, Any]] = []
         for notice in notices:
-            key = re.sub(r"\d+(?:\.\d+)?\s*Mbps", "", notice)
+            key = f"{notice['media']}|{notice['drop_ver']}|{notice['keep_ver']}"
             if key in sent:
                 continue
             sent[key] = now
             fresh.append(notice)
         self.save_data(SELECTION_NOTICE_KEY, sent)
         return fresh
+
+    @staticmethod
+    def _render_selection_notice(notices: List[Dict[str, Any]], limit: int = 4) -> str:
+        """
+        把淘汰明细渲染为按剧分组的通知正文。
+
+        每部剧一段：剧名一行，保留版本一行，其下列出被它淘汰的版本及码率差。
+        """
+        grouped: Dict[str, Dict[Tuple[str, float], List[Dict[str, Any]]]] = {}
+        for notice in notices:
+            keeps = grouped.setdefault(notice["media"], {})
+            keeps.setdefault((notice["keep_ver"], notice["keep_rate"]), []).append(notice)
+        blocks: List[str] = []
+        for media, keeps in list(grouped.items())[:limit]:
+            lines = [media]
+            for (keep_ver, keep_rate), drops in keeps.items():
+                lines.append(f"✅ 保留 {keep_ver}　{keep_rate:.1f} Mbps")
+                for drop in drops:
+                    lower = (1 - drop["drop_rate"] / keep_rate) * 100 if keep_rate else 0
+                    lines.append(
+                        f"⛔ 淘汰 {drop['drop_ver']}　{drop['drop_rate']:.1f} Mbps（低 {lower:.0f}%）"
+                    )
+            blocks.append("\n".join(lines))
+        more = len(grouped) - limit
+        if more > 0:
+            blocks.append(f"…另有 {more} 部剧，详见日志")
+        return "\n\n".join(blocks)
 
     @eventmanager.register(ChainEventType.ResourceDownload)
     def on_resource_download(self, event: Event) -> None:
@@ -567,14 +594,33 @@ class BitrateSelector(_PluginBase):
     def _notify_version_label(ctx: Any) -> str:
         """构造通知用的「发布组 + 特效」版本短标签，缺失时截取种子名。"""
         meta = getattr(ctx, "meta_info", None)
-        parts = [
-            str(getattr(meta, "resource_team", "") or ""),
-            str(getattr(meta, "resource_effect", "") or ""),
-        ]
-        label = " ".join(part for part in parts if part)
+        team = str(getattr(meta, "resource_team", "") or "").strip()
+        effect = BitrateSelector._dedupe_effect_tokens(
+            str(getattr(meta, "resource_effect", "") or "")
+        )
+        label = " · ".join(part for part in (team, effect) if part)
         if not label:
             label = (getattr(getattr(ctx, "torrent_info", None), "title", "") or "")[:24]
         return label
+
+    @staticmethod
+    def _dedupe_effect_tokens(effect: str) -> str:
+        """去掉被更具体标记包含的重复特效词，如「HDR10 HDR」→「HDR10」。"""
+        tokens: List[str] = []
+        for token in effect.split():
+            if token.lower() not in (t.lower() for t in tokens):
+                tokens.append(token)
+        kept = [
+            token
+            for token in tokens
+            if not any(
+                other is not token
+                and len(other) > len(token)
+                and other.lower().startswith(token.lower())
+                for other in tokens
+            )
+        ]
+        return " ".join(kept)
 
     def _apply_wash_patch(self) -> None:
         """
@@ -1795,11 +1841,11 @@ class BitrateSelector(_PluginBase):
 
     def _drop_dominated_candidates(
         self, contexts: List[Any]
-    ) -> Tuple[List[Any], List[str], List[str]]:
+    ) -> Tuple[List[Any], List[str], List[Dict[str, Any]]]:
         """
         按媒体身份与覆盖类别分组，淘汰被高码率候选覆盖的低码率候选。
 
-        :return: (保留的候选列表, 日志用完整描述列表, 通知用简短描述列表)
+        :return: (保留的候选列表, 日志用完整描述列表, 通知用结构化淘汰明细列表)
         """
         groups: Dict[str, List[Tuple[int, Set[int], float, str, str, str]]] = {}
         for idx, ctx in enumerate(contexts):
@@ -1824,7 +1870,7 @@ class BitrateSelector(_PluginBase):
             groups.setdefault(f"{group_key}|{coverage}", []).append(
                 (idx, episodes, bitrate, title, media_label, version_label)
             )
-        drop: Dict[int, Tuple[str, str]] = {}
+        drop: Dict[int, Tuple[str, Dict[str, Any]]] = {}
         margin = max(0, int(self._margin_percent)) / 100.0
         for items in groups.values():
             for idx, eps, bitrate, title, media_label, version_label in items:
@@ -1840,10 +1886,13 @@ class BitrateSelector(_PluginBase):
                             (
                                 f"{title}（{bitrate:.1f}Mbps）← 保留 {title2}（{bitrate2:.1f}Mbps）"
                             ),
-                            (
-                                f"{media_label}：淘汰 {version_label} {bitrate:.1f}Mbps"
-                                f" → 保留 {version2} {bitrate2:.1f}Mbps"
-                            ),
+                            {
+                                "media": media_label,
+                                "drop_ver": version_label,
+                                "drop_rate": round(bitrate, 1),
+                                "keep_ver": version2,
+                                "keep_rate": round(bitrate2, 1),
+                            },
                         )
                         break
         if not drop:
