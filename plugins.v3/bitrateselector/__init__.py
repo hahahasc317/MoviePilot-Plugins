@@ -55,6 +55,13 @@ PATCH_TARGETS = {
     PATCH_PREPARE: ["subscribe", "context", "priority"],
     PATCH_PACK_GATE: ["subscribe", "priority"],
 }
+# 播种时按 strm 实际文件核实码率：边车码率低于此值或该集有防降级下限时核实
+SEED_VERIFY_BELOW_MBPS = 8.0
+# 核实值与既有基线相差超过该比例即以核实值为准
+SEED_VERIFY_TOLERANCE = 0.15
+# 单次播种最多核实的集数与核实间隔，防止 115 直链请求过密
+SEED_VERIFY_MAX_PER_RUN = 300
+SEED_VERIFY_INTERVAL_SECONDS = 0.3
 # 选种淘汰通知去重记录的存储键与去重时长
 SELECTION_NOTICE_KEY = "selection_notices"
 SELECTION_NOTICE_TTL_SECONDS = 24 * 3600
@@ -80,7 +87,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.4.4"
+    plugin_version = "1.4.5"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -104,6 +111,8 @@ class BitrateSelector(_PluginBase):
     _seed_lock = threading.Lock()
     # 手动巡检互斥
     _inspect_lock = threading.Lock()
+    # 本次播种剩余的 strm 核实额度
+    _seed_verify_budget = 0
     # 整包码率放行标记：{id(context): (时间, 种子标题, 可洗集合)}
     _wash_marks: Dict[int, Tuple[float, str, Set[int]]] = {}
     # 各补丁当前状态：{函数名: "active" / "incompatible:<原因>" / "missing"}
@@ -1695,6 +1704,7 @@ class BitrateSelector(_PluginBase):
         changed = 0
         corrected_total = 0
         matched = 0
+        self._seed_verify_budget = SEED_VERIFY_MAX_PER_RUN
         for subscribe in subscriptions:
             seeded, corrected = self._seed_subscription_baseline(subscribe, root)
             if seeded < 0:
@@ -1747,26 +1757,60 @@ class BitrateSelector(_PluginBase):
         entry = self._baselines.setdefault(key, {})
         episode_map = entry.setdefault("episodes", {})
         floor_map = entry.setdefault("ep_floors", {})
+        source_map = entry.setdefault("ep_sources", {})
         seeded = 0
         corrected = 0
+        verified_fixed = 0
         for info_path in sorted(season_dir.glob("*-mediainfo.json")):
             episode_number = self._episode_from_filename(info_path.name)
             if not episode_number:
                 continue
-            bitrate = self._mediainfo_bitrate_mbps(info_path)
-            if bitrate is None:
+            ep_key = str(episode_number)
+            sidecar = self._mediainfo_bitrate_mbps(info_path)
+            if sidecar is None:
                 continue
-            existing = episode_map.get(str(episode_number))
+            existing = episode_map.get(ep_key)
+            has_floor = self._floor_value(floor_map.get(ep_key)) is not None
+            bitrate = sidecar
+            verified = False
+            # 边车 mediainfo 换版后可能不刷新：偏低或带防降级下限的集，按 strm 实际文件核实
+            if has_floor or sidecar < SEED_VERIFY_BELOW_MBPS or (
+                existing is not None and float(existing) < SEED_VERIFY_BELOW_MBPS
+            ):
+                actual, status = self._verified_library_bitrate(info_path)
+                if status == "stale":
+                    # 无同名 strm：边车是换版残留，不代表当前版本
+                    continue
+                if actual is not None:
+                    bitrate = actual
+                    verified = True
+                elif has_floor:
+                    # 核实失败且有下限：不拿可能过期的边车覆盖，保留下限
+                    continue
             if existing is None:
-                episode_map[str(episode_number)] = bitrate
-                floor_map.pop(str(episode_number), None)
+                episode_map[ep_key] = bitrate
+                source_map[ep_key] = "measured"
+                floor_map.pop(ep_key, None)
                 seeded += 1
-            elif self._baseline_diverged(existing, bitrate):
-                episode_map[str(episode_number)] = bitrate
-                floor_map.pop(str(episode_number), None)
-                corrected += 1
-            else:
-                floor_map.pop(str(episode_number), None)
+            elif self._baseline_diverged(existing, bitrate) or (
+                verified and abs(float(existing) - bitrate) > float(existing) * SEED_VERIFY_TOLERANCE
+            ):
+                if verified and not self._baseline_diverged(existing, bitrate):
+                    verified_fixed += 1
+                else:
+                    corrected += 1
+                episode_map[ep_key] = bitrate
+                source_map[ep_key] = "measured"
+                floor_map.pop(ep_key, None)
+            elif ep_key in floor_map:
+                floor_map.pop(ep_key, None)
+                verified_fixed += 1
+        if verified_fixed:
+            logger.info(
+                f"码率优选：库内播种 {key} 按 strm 实际文件核实修正 {verified_fixed} 集基线"
+                f"（{show_dir.name}）"
+            )
+            corrected += verified_fixed
         if corrected:
             logger.warning(
                 f"码率优选：库内播种 {key} 校正 {corrected} 集基线为实测值"
@@ -1875,6 +1919,25 @@ class BitrateSelector(_PluginBase):
                 f"码率优选：strm 实际大小获取失败（{strm_path.name}）：{err}"
             )
             return True, None
+
+    def _verified_library_bitrate(self, info_path: Path) -> Tuple[Optional[float], str]:
+        """
+        按同名 strm 指向的实际文件大小与边车时长计算当前版本码率（Mbps）。
+
+        :return: (码率, 状态)；状态 ok=核实成功，stale=无同名 strm（边车为换版残留），
+                 failed=无法核实（请求失败、无时长或核实额度用尽）
+        """
+        if self._seed_verify_budget <= 0:
+            return None, "failed"
+        self._seed_verify_budget -= 1
+        has_strm, size = self._strm_remote_size(info_path)
+        if not has_strm:
+            return None, "stale"
+        runtime = self._mediainfo_runtime_seconds(info_path)
+        time.sleep(SEED_VERIFY_INTERVAL_SECONDS)
+        if not size or not runtime:
+            return None, "failed"
+        return round(size * 8 / runtime / 1_000_000, 2), "ok"
 
     @staticmethod
     def _mediainfo_runtime_seconds(path: Path) -> Optional[float]:

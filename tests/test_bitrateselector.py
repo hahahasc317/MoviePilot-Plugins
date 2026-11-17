@@ -270,6 +270,64 @@ class InspectCommandTest(unittest.TestCase):
         self.assertIn("未启用", plugin.messages[-1]["text"])
 
 
+class SeedVerifyTest(unittest.TestCase):
+    """复现玫瑰战争：换版后边车 mediainfo 未刷新，基线停在 4Mbps、下限被误清。"""
+
+    def setUp(self):
+        import json
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.season = Path(self.tmp.name) / "玫瑰战争 (2026)" / "Season 1"
+        self.season.mkdir(parents=True)
+        runtime_ticks = 45 * 60 * 10_000_000
+        for ep, sidecar_mbps in ((5, 5.18), (14, 14.72), (22, 4.03)):
+            stem = f"玫瑰战争 - S01E{ep:02d} - 第 {ep} 集"
+            (self.season / f"{stem}-mediainfo.json").write_text(json.dumps([{"MediaSourceInfo": {
+                "RunTimeTicks": runtime_ticks,
+                "MediaStreams": [{"Type": "Video", "BitRate": int(sidecar_mbps * 1_000_000)}]}}]))
+            (self.season / f"{stem}.strm").write_text(f"http://nas/{ep}")
+        # E5、E22 实际已是约 15Mbps 的新版本；E14 未换版
+        self.sizes = {"5": 15.2, "22": 15.0, "14": 14.72}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _plugin(self):
+        plugin = make_plugin()
+        plugin._baselines = {"themoviedb:299276:1": {
+            "episodes": {"5": 5.18, "14": 14.72, "22": 4.03},
+            "ep_floors": {"22": [15.01, time.time() - 3600]},
+        }}
+        sizes = self.sizes
+
+        def remote_size(info_path):
+            ep = str(int(info_path.name.split("S01E")[1][:2]))
+            return True, int(sizes[ep] * 1_000_000 / 8 * 45 * 60)
+
+        plugin._strm_remote_size = remote_size
+        plugin._seed_verify_budget = 10
+        bs.SEED_VERIFY_INTERVAL_SECONDS = 0
+        return plugin
+
+    def test_stale_sidecar_corrected_by_actual_file(self):
+        plugin = self._plugin()
+        seeded, corrected = plugin._seed_subscription_baseline(make_subscribe(), Path(self.tmp.name))
+        entry = plugin._baselines["themoviedb:299276:1"]
+        self.assertAlmostEqual(entry["episodes"]["5"], 15.2, places=1)
+        self.assertAlmostEqual(entry["episodes"]["22"], 15.0, places=1)
+        self.assertEqual(entry["episodes"]["14"], 14.72)
+        self.assertNotIn("22", entry["ep_floors"])
+        self.assertEqual((seeded, corrected), (0, 2))
+
+    def test_floor_kept_when_verification_fails(self):
+        plugin = self._plugin()
+        plugin._strm_remote_size = lambda info_path: (True, None)
+        plugin._seed_subscription_baseline(make_subscribe(), Path(self.tmp.name))
+        entry = plugin._baselines["themoviedb:299276:1"]
+        self.assertIn("22", entry["ep_floors"])
+        self.assertEqual(entry["episodes"]["22"], 4.03)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -346,6 +404,64 @@ class InspectCommandTest(unittest.TestCase):
         self.assertEqual(plugin.messages, [])
         plugin.on_plugin_action(NS(event_data={"action": "bitrate_inspect"}))
         self.assertIn("未启用", plugin.messages[-1]["text"])
+
+
+class SeedVerifyTest(unittest.TestCase):
+    """复现玫瑰战争：换版后边车 mediainfo 未刷新，基线停在 4Mbps、下限被误清。"""
+
+    def setUp(self):
+        import json
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.season = Path(self.tmp.name) / "玫瑰战争 (2026)" / "Season 1"
+        self.season.mkdir(parents=True)
+        runtime_ticks = 45 * 60 * 10_000_000
+        for ep, sidecar_mbps in ((5, 5.18), (14, 14.72), (22, 4.03)):
+            stem = f"玫瑰战争 - S01E{ep:02d} - 第 {ep} 集"
+            (self.season / f"{stem}-mediainfo.json").write_text(json.dumps([{"MediaSourceInfo": {
+                "RunTimeTicks": runtime_ticks,
+                "MediaStreams": [{"Type": "Video", "BitRate": int(sidecar_mbps * 1_000_000)}]}}]))
+            (self.season / f"{stem}.strm").write_text(f"http://nas/{ep}")
+        # E5、E22 实际已是约 15Mbps 的新版本；E14 未换版
+        self.sizes = {"5": 15.2, "22": 15.0, "14": 14.72}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _plugin(self):
+        plugin = make_plugin()
+        plugin._baselines = {"themoviedb:299276:1": {
+            "episodes": {"5": 5.18, "14": 14.72, "22": 4.03},
+            "ep_floors": {"22": [15.01, time.time() - 3600]},
+        }}
+        sizes = self.sizes
+
+        def remote_size(info_path):
+            ep = str(int(info_path.name.split("S01E")[1][:2]))
+            return True, int(sizes[ep] * 1_000_000 / 8 * 45 * 60)
+
+        plugin._strm_remote_size = remote_size
+        plugin._seed_verify_budget = 10
+        bs.SEED_VERIFY_INTERVAL_SECONDS = 0
+        return plugin
+
+    def test_stale_sidecar_corrected_by_actual_file(self):
+        plugin = self._plugin()
+        seeded, corrected = plugin._seed_subscription_baseline(make_subscribe(), Path(self.tmp.name))
+        entry = plugin._baselines["themoviedb:299276:1"]
+        self.assertAlmostEqual(entry["episodes"]["5"], 15.2, places=1)
+        self.assertAlmostEqual(entry["episodes"]["22"], 15.0, places=1)
+        self.assertEqual(entry["episodes"]["14"], 14.72)
+        self.assertNotIn("22", entry["ep_floors"])
+        self.assertEqual((seeded, corrected), (0, 2))
+
+    def test_floor_kept_when_verification_fails(self):
+        plugin = self._plugin()
+        plugin._strm_remote_size = lambda info_path: (True, None)
+        plugin._seed_subscription_baseline(make_subscribe(), Path(self.tmp.name))
+        entry = plugin._baselines["themoviedb:299276:1"]
+        self.assertIn("22", entry["ep_floors"])
+        self.assertEqual(entry["episodes"]["22"], 4.03)
 
 
 if __name__ == "__main__":
