@@ -42,6 +42,18 @@ MEDIA_EXT = re.compile(
     r"\.(mkv|mp4|ts|iso|wmv|avi|rmvb|flv|mov|m2ts|mpg|mpeg|webm)$", re.I
 )
 SHA_RE = re.compile(r"[0-9A-Fa-f]{40}")
+# 日志事件字段提取（纯正则，绝不对日志文本求值：文件名来自种子，属外部可控输入）
+LOG_EVENT_RE = re.compile(r"\{'id'.*?\}")
+LOG_FILE_ID_RE = re.compile(r"'file_id':\s*'?(\d+)'?")
+LOG_SHA1_RE = re.compile(r"'sha1':\s*'([0-9A-Fa-f]{40})'")
+# 暂存对象最小年龄：上传刚完成、CD2 尚未 promote 改名的正常对象不触碰
+STAGE_MIN_AGE = 5 * 60
+# 边车文件名的「-后缀」形式（如 S01E01-thumb.jpg），剥离后再与 strm/视频 stem 比对
+SIDECAR_SUFFIX_RE = re.compile(
+    r"-(thumb|fanart|poster|landscape|banner|clearart|clearlogo|logo|backdrop|disc)$", re.I
+)
+# 孤儿边车单轮删除上限：超过视为异常（strm 临时缺失/挂载抖动），本轮只统计不删除
+ORPHAN_MAX_DELETE = 50
 
 
 def load_cookie() -> str:
@@ -144,7 +156,29 @@ def _finding_from_item(path: str, cid: int, item: dict) -> dict:
         "size": int(item.get("s") or 0),
         "pickcode": item.get("pc") or "",
         "sha": (item.get("sha") or "").strip(),
+        "mtime": _item_mtime(item),
     }
+
+
+def _item_mtime(item: dict) -> Optional[int]:
+    """取 webapi 条目最近的时间戳（秒）；字段缺失或无法解析时返回 None。"""
+    stamps = []
+    for key in ("tu", "te", "tp", "t"):
+        value = item.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text.isdigit():
+            stamps.append(int(text))
+    return max(stamps) if stamps else None
+
+
+def is_fresh(finding: dict, now: Optional[float] = None) -> bool:
+    """暂存对象是否过于新鲜（可能仍在正常 promote 流程中）。时间未知时按非新鲜处理。"""
+    mtime = finding.get("mtime")
+    if not mtime:
+        return False
+    return (now or time.time()) - mtime < STAGE_MIN_AGE
 
 
 def infer_clean_name(name: str) -> Optional[str]:
@@ -201,26 +235,28 @@ def clean_name_from_history(stem: str) -> Optional[str]:
     return None
 
 
+def parse_log_sha1(line: str, fid: int) -> Optional[str]:
+    """从单行生活事件日志中解析指定 file_id 的 SHA1（纯正则，不求值）。"""
+    for match in LOG_EVENT_RE.finditer(line):
+        snippet = match.group(0)
+        id_match = LOG_FILE_ID_RE.search(snippet)
+        sha_match = LOG_SHA1_RE.search(snippet)
+        if id_match and sha_match and id_match.group(1) == str(fid):
+            return sha_match.group(1).upper()
+    return None
+
+
 def sha1_from_logs(fid: int) -> Optional[str]:
     """从 p115strmhelper 生活事件日志回溯文件 SHA1。"""
-    pat = re.compile(r"\{'id'.*?\}")
     for logfile in sorted(glob.glob(LOG_GLOB), reverse=True):
         try:
             with open(logfile, encoding="utf-8", errors="ignore") as fh:
                 for line in fh:
                     if str(fid) not in line or "'sha1'" not in line:
                         continue
-                    m = pat.search(line)
-                    if not m:
-                        continue
-                    try:
-                        ev = eval(m.group(0), {"__builtins__": {}})  # noqa: S307
-                    except Exception:
-                        continue
-                    if str(ev.get("file_id")) == str(fid) and SHA_RE.fullmatch(
-                        str(ev.get("sha1") or "")
-                    ):
-                        return ev["sha1"].upper()
+                    sha1 = parse_log_sha1(line, fid)
+                    if sha1:
+                        return sha1
         except OSError:
             continue
     return None
@@ -246,9 +282,12 @@ def get_sha1(client: P115Client, finding: dict) -> Optional[str]:
 def fix_one(client: P115Client, finding: dict) -> Tuple[str, str]:
     """修复单个残留对象，返回 (结果类别, 说明)。
 
-    类别: fixed（秒传重建）/ dedup（正式对象已在，仅清理）/ manual / failed。
+    类别: fixed（秒传重建）/ dedup（正式对象已在，仅清理）/ fresh（过新跳过）/
+    manual / failed。
     """
     name = finding["name"]
+    if is_fresh(finding):
+        return "fresh", f"对象不足 {STAGE_MIN_AGE // 60} 分钟，可能仍在正常改名，下轮再查: {name}"
     clean = infer_clean_name(name)
     if not clean:
         stem = re.sub(r"\.mp-stage-[0-9a-fA-F]+$", "", name.split("**", 1)[0])
@@ -318,38 +357,77 @@ def fix_one(client: P115Client, finding: dict) -> Tuple[str, str]:
     return ("dedup" if existing is not None else "fixed"), clean
 
 
-def clean_orphan_sidecars(apply: bool = True) -> Tuple[int, int]:
-    """清理换代残留的孤儿边车（本地 /media）。
+def _sidecar_owner_stems(stem: str) -> Tuple[str, ...]:
+    """边车可能归属的媒体 stem：原样，以及去掉 -thumb 等后缀的形式。"""
+    stripped = SIDECAR_SUFFIX_RE.sub("", stem)
+    return (stem, stripped) if stripped != stem else (stem,)
 
-    判定：边车 stem 不匹配同目录任何 strm/视频文件，且排除目录级资源
-    （poster.jpg/season*.jpg 等）。超过 24 小时的才删，避免误伤换版进行中的文件。
-    返回 (删除数, 防护拦截数)；apply=False 时仅统计。
+
+def find_orphan_sidecars(root: Optional[str] = None,
+                         now: Optional[float] = None) -> Tuple[List[str], int]:
+    """找出可清理的孤儿边车，返回 (候选路径列表, 防护拦截数)。
+
+    判定：边车 stem（含去 -thumb 等后缀形式）不匹配同目录任何 strm/视频文件，
+    且排除目录级资源（poster.jpg/season*.jpg 等）、不足 24 小时的新鲜文件。
+    目录内一个 strm/视频都没有时整目录跳过：多半是 strm 正在重建或挂载异常，
+    不能据此把整季边车当孤儿。
     """
-    now = time.time()
-    deleted = guard = 0
-    for dirpath, _dirs, files in os.walk(ORPHAN_MEDIA_ROOT):
+    root = root or ORPHAN_MEDIA_ROOT
+    now = now or time.time()
+    candidates: List[str] = []
+    guard = 0
+    for dirpath, _dirs, files in os.walk(root):
         strm_stems = {f[:-5] for f in files if f.endswith(".strm")}
         video_stems = {
             os.path.splitext(f)[0] for f in files if f.lower().endswith(VIDEO_STEM_EXTS)
         }
+        owners = strm_stems | video_stems
         for f in files:
             if DIR_ASSET_RE.match(f):
                 continue
             m = SIDECAR_RE.search(f)
             if not m:
                 continue
-            stem = f[: m.start()]
-            if stem in strm_stems or stem in video_stems:
+            if any(s in owners for s in _sidecar_owner_stems(f[: m.start()])):
                 continue
             path = os.path.join(dirpath, f)
+            if not owners:
+                guard += 1
+                continue
             try:
                 if now - os.path.getmtime(path) < ORPHAN_MIN_AGE:
                     guard += 1
                     continue
-                if apply:
-                    os.remove(path)
-                    logger.info(f"MPStageFixer：孤儿边车已删除: {path}")
-                deleted += 1
             except OSError:
                 guard += 1
-    return deleted, guard
+                continue
+            candidates.append(path)
+    return candidates, guard
+
+
+def clean_orphan_sidecars(apply: bool = True,
+                          max_delete: int = ORPHAN_MAX_DELETE) -> Tuple[int, int, bool]:
+    """清理换代残留的孤儿边车（本地 /media）。
+
+    候选数超过 max_delete 时判定为异常（strm 大面积缺失），本轮一个都不删。
+    返回 (删除数, 防护拦截数, 是否触发刹车)；apply=False 时仅统计。
+    """
+    candidates, guard = find_orphan_sidecars()
+    if len(candidates) > max_delete:
+        logger.warning(
+            f"MPStageFixer：孤儿边车候选 {len(candidates)} 个，超过单轮上限 {max_delete}，"
+            "疑似 strm 缺失或挂载异常，本轮不删除"
+        )
+        return 0, guard + len(candidates), True
+    deleted = 0
+    for path in candidates:
+        if not apply:
+            deleted += 1
+            continue
+        try:
+            os.remove(path)
+            deleted += 1
+            logger.info(f"MPStageFixer：孤儿边车已删除: {path}")
+        except OSError:
+            guard += 1
+    return deleted, guard, False

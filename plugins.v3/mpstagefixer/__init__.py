@@ -13,7 +13,7 @@ DEFAULT_CRON = "15 */6 * * *"
 REPORT_KEY = "last_report"
 REVIEW_KEY = "last_review_report"
 DEFAULT_REVIEW_CRON = "*/30 * * * *"
-QUICK_DELAY_SECONDS = 120
+QUICK_DELAY_SECONDS = 420  # 须大于 stagefix.STAGE_MIN_AGE，否则定向复查会把新残留当新鲜对象跳过
 RUN_LOCK = threading.Lock()
 REVIEW_LOCK = threading.Lock()
 
@@ -28,7 +28,7 @@ class MPStageFixer(_PluginBase):
         "定时核验 durable 整理待复核任务，仅对目标可证实的步骤自动判定 applied。"
     )
     plugin_icon = ""
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "mpstagefixer_"
     plugin_order = 15
@@ -151,7 +151,7 @@ class MPStageFixer(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "orphan_clean",
-                                            "label": "顺带清理孤儿边车（超24小时）",
+                                            "label": "顺带清理孤儿边车（超24小时；单轮超50个自动刹车）",
                                         },
                                     }
                                 ],
@@ -248,7 +248,8 @@ class MPStageFixer(_PluginBase):
             f"扫描目录：{report.get('visited', '-')}　残留：{report.get('findings', '-')}",
             f"重建：{report.get('fixed', 0)}　清理重复：{report.get('dedup', 0)}"
             f"　失败：{report.get('failed', 0)}　需人工：{report.get('manual', 0)}",
-            f"孤儿边车：删除 {report.get('orphan_deleted', 0)} / 防护拦截 {report.get('orphan_guard', 0)}",
+            f"孤儿边车：删除 {report.get('orphan_deleted', 0)} / 防护拦截 {report.get('orphan_guard', 0)}"
+            + ("（候选过多已刹车，未删除）" if report.get("orphan_braked") else ""),
         ]
         details = report.get("details") or []
         content = [
@@ -489,9 +490,10 @@ class MPStageFixer(_PluginBase):
                 else:
                     logger.warning(f"MPStageFixer：[{result}] {detail}")
             if self._orphan_clean:
-                o_deleted, o_guard = stagefix.clean_orphan_sidecars(apply=True)
+                o_deleted, o_guard, o_braked = stagefix.clean_orphan_sidecars(apply=True)
                 report["orphan_deleted"] = o_deleted
                 report["orphan_guard"] = o_guard
+                report["orphan_braked"] = o_braked
             self._save_and_notify(report)
             return report
         finally:
@@ -553,6 +555,8 @@ class MPStageFixer(_PluginBase):
             + report.get("failed", 0)
             + report.get("manual", 0)
         )
+        if report.get("orphan_braked"):
+            interesting += 1
         if not always and interesting <= 0:
             return
         lines = [
@@ -562,6 +566,8 @@ class MPStageFixer(_PluginBase):
             f"　需人工：{report.get('manual', 0)}",
         ]
         details = report.get("details") or []
+        if report.get("orphan_braked"):
+            lines.append("孤儿边车候选数量异常，已刹车未删除，请检查 strm 是否缺失")
         if details:
             lines.extend(details[:5])
         self.post_message(mtype=None, title="MP暂存残留修复", text="\n".join(lines))
