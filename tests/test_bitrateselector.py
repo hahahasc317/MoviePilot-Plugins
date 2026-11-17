@@ -328,6 +328,38 @@ class SeedVerifyTest(unittest.TestCase):
         self.assertEqual(entry["episodes"]["22"], 4.03)
 
 
+class RecordBaselineTest(unittest.TestCase):
+    """复现多喜一家人 E06：10.4GB 整季包只为 E06 下载，旧版按单集估出 30Mbps 虚高下限。"""
+
+    def test_pack_for_single_episode_uses_pack_coverage(self):
+        plugin = make_plugin()
+        plugin._baselines = {"themoviedb:1:1": {"episodes": {"6": 1.5}}}
+        size = int(10.4 * 1024 ** 3)
+        ctx = NS(
+            torrent_info=NS(size=size, title="Still.a.Family.S01.HHWEB", pri_order=100),
+            meta_info=NS(begin_season=1, episode_list=[]),
+            media_info=NS(media_source="themoviedb", media_id="1", tmdb_id=1, title="多喜一家人", year="2026"),
+        )
+        plugin._record_wash_baseline(NS(context=ctx, episodes={6}))
+        entry = plugin._baselines["themoviedb:1:1"]
+        pack_rate = size * 8 / (25 * 45 * 60) / 1_000_000   # 全季 25 集各 45 分钟
+        self.assertAlmostEqual(entry["episodes"]["6"], round(pack_rate, 2), places=2)
+        self.assertFalse(entry.get("ep_floors"))
+        single_ep_rate = size * 8 / (45 * 60) / 1_000_000
+        self.assertGreater(single_ep_rate, 30)   # 旧算法的虚高值
+
+    def test_old_floors_migrated_once(self):
+        plugin = make_plugin()
+        plugin._baselines = {"k": {"episodes": {"6": 8.0}, "ep_floors": {"6": [30.27, time.time()]},
+                                   "full_floor": [20.0, time.time()]}}
+        plugin._migrate_inflated_floors()
+        self.assertEqual(plugin._baselines["k"]["ep_floors"], {})
+        self.assertNotIn("full_floor", plugin._baselines["k"])
+        plugin._baselines["k"]["ep_floors"] = {"7": [12.0, time.time()]}
+        plugin._migrate_inflated_floors()   # 第二次不再清除新记录的下限
+        self.assertIn("7", plugin._baselines["k"]["ep_floors"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -462,6 +494,38 @@ class SeedVerifyTest(unittest.TestCase):
         entry = plugin._baselines["themoviedb:299276:1"]
         self.assertIn("22", entry["ep_floors"])
         self.assertEqual(entry["episodes"]["22"], 4.03)
+
+
+class RecordBaselineTest(unittest.TestCase):
+    """复现多喜一家人 E06：10.4GB 整季包只为 E06 下载，旧版按单集估出 30Mbps 虚高下限。"""
+
+    def test_pack_for_single_episode_uses_pack_coverage(self):
+        plugin = make_plugin()
+        plugin._baselines = {"themoviedb:1:1": {"episodes": {"6": 1.5}}}
+        size = int(10.4 * 1024 ** 3)
+        ctx = NS(
+            torrent_info=NS(size=size, title="Still.a.Family.S01.HHWEB", pri_order=100),
+            meta_info=NS(begin_season=1, episode_list=[]),
+            media_info=NS(media_source="themoviedb", media_id="1", tmdb_id=1, title="多喜一家人", year="2026"),
+        )
+        plugin._record_wash_baseline(NS(context=ctx, episodes={6}))
+        entry = plugin._baselines["themoviedb:1:1"]
+        pack_rate = size * 8 / (25 * 45 * 60) / 1_000_000   # 全季 25 集各 45 分钟
+        self.assertAlmostEqual(entry["episodes"]["6"], round(pack_rate, 2), places=2)
+        self.assertFalse(entry.get("ep_floors"))
+        single_ep_rate = size * 8 / (45 * 60) / 1_000_000
+        self.assertGreater(single_ep_rate, 30)   # 旧算法的虚高值
+
+    def test_old_floors_migrated_once(self):
+        plugin = make_plugin()
+        plugin._baselines = {"k": {"episodes": {"6": 8.0}, "ep_floors": {"6": [30.27, time.time()]},
+                                   "full_floor": [20.0, time.time()]}}
+        plugin._migrate_inflated_floors()
+        self.assertEqual(plugin._baselines["k"]["ep_floors"], {})
+        self.assertNotIn("full_floor", plugin._baselines["k"])
+        plugin._baselines["k"]["ep_floors"] = {"7": [12.0, time.time()]}
+        plugin._migrate_inflated_floors()   # 第二次不再清除新记录的下限
+        self.assertIn("7", plugin._baselines["k"]["ep_floors"])
 
 
 if __name__ == "__main__":

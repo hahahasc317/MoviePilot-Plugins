@@ -62,6 +62,8 @@ SEED_VERIFY_TOLERANCE = 0.15
 # 单次播种最多核实的集数与核实间隔，防止 115 直链请求过密
 SEED_VERIFY_MAX_PER_RUN = 300
 SEED_VERIFY_INTERVAL_SECONDS = 0.3
+# 旧版虚高下限一次性清理标记
+FLOOR_MIGRATION_KEY = "floor_migration_146"
 # 选种淘汰通知去重记录的存储键与去重时长
 SELECTION_NOTICE_KEY = "selection_notices"
 SELECTION_NOTICE_TTL_SECONDS = 24 * 3600
@@ -87,7 +89,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.4.5"
+    plugin_version = "1.4.6"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -150,6 +152,7 @@ class BitrateSelector(_PluginBase):
             self._inspect_days = 30
         with self._baseline_lock:
             self._baselines = self.get_data(WASH_BASELINES_KEY) or {}
+            self._migrate_inflated_floors()
         self._wash_marks = {}
         self._apply_wash_patch()
         if self._wash_enabled:
@@ -439,6 +442,28 @@ class BitrateSelector(_PluginBase):
             },
             *self._patch_status_page(),
         ]
+
+    def _migrate_inflated_floors(self) -> None:
+        """
+        一次性清除 1.4.6 之前记录的防降级下限。
+
+        旧版整季包只为部分集下载时把整包体积摊到所选集上，下限可能虚高数倍，
+        会在 48 小时内拦下所有正常候选；清除后由库内播种按实际文件重建基线。
+        """
+        if self.get_data(FLOOR_MIGRATION_KEY):
+            return
+        cleared = 0
+        for entry in self._baselines.values():
+            floors = entry.get("ep_floors") or {}
+            cleared += len(floors)
+            if floors:
+                entry["ep_floors"] = {}
+            if entry.pop("full_floor", None) is not None:
+                cleared += 1
+        if cleared:
+            self.save_data(WASH_BASELINES_KEY, self._baselines)
+            logger.info(f"码率优选：已清除 {cleared} 条旧版可能虚高的防降级下限，由库内播种重建基线")
+        self.save_data(FLOOR_MIGRATION_KEY, True)
 
     def _patch_status_page(self) -> List[Dict[str, Any]]:
         """详情页展示运行时补丁状态与当前降级待洗记录数。"""
@@ -1159,7 +1184,10 @@ class BitrateSelector(_PluginBase):
                 f"码率优选：下载事件缺少媒体身份（{ctx.media_info}），未记录码率基线"
             )
             return
-        bitrate, duration_source = self._estimate_bitrate_ex(ctx, episodes)
+        # 码率按种子自身覆盖范围估算（与准入同口径）：整季包只为其中几集下载时，
+        # 若按所选集时长计算，会把整包体积摊到一两集上，估算虚高数倍
+        coverage = set(meta.episode_list or []) if meta else set()
+        bitrate, duration_source = self._estimate_bitrate_ex(ctx, coverage)
         if bitrate is None:
             logger.warning(
                 f"码率优选：无法估算下载码率（{ctx.torrent_info.title}），未记录码率基线"
