@@ -19,7 +19,7 @@ from app.sdk.logging import logger
 from app.sdk.media import Context
 from app.schemas.event import ResourceDownloadEventData, ResourceSelectionEventData
 from app.schemas.media import resolve_media_identity
-from app.schemas.types import ChainEventType, MediaType
+from app.schemas.types import ChainEventType, EventType, MediaType
 
 # 单集时长缓存的存活时间（秒）
 RUNTIME_CACHE_TTL_SECONDS = 6 * 3600
@@ -80,7 +80,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.4.3"
+    plugin_version = "1.4.4"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -102,6 +102,8 @@ class BitrateSelector(_PluginBase):
     _baseline_lock = threading.RLock()
     # 播种互斥：同一时间只允许一个播种任务
     _seed_lock = threading.Lock()
+    # 手动巡检互斥
+    _inspect_lock = threading.Lock()
     # 整包码率放行标记：{id(context): (时间, 种子标题, 可洗集合)}
     _wash_marks: Dict[int, Tuple[float, str, Set[int]]] = {}
     # 各补丁当前状态：{函数名: "active" / "incompatible:<原因>" / "missing"}
@@ -153,7 +155,52 @@ class BitrateSelector(_PluginBase):
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
         """返回插件远程命令列表。"""
-        return []
+        return [
+            {
+                "cmd": "/bitrate_inspect",
+                "event": EventType.PluginAction,
+                "desc": "立即执行低码巡检洗版",
+                "category": "",
+                "data": {"action": "bitrate_inspect"},
+            }
+        ]
+
+    @eventmanager.register(EventType.PluginAction)
+    def on_plugin_action(self, event: Event = None) -> None:
+        """响应 /bitrate_inspect 命令，在后台立即执行一轮低码巡检。"""
+        event_data = getattr(event, "event_data", None) or {}
+        if not isinstance(event_data, dict) or event_data.get("action") != "bitrate_inspect":
+            return
+        if not (self._enabled and self._inspect_enabled):
+            self.post_message(
+                mtype=None, title="码率优选巡检", text="插件或「低码巡检洗版」未启用，未执行。"
+            )
+            return
+        if not self._inspect_lock.acquire(blocking=False):
+            self.post_message(mtype=None, title="码率优选巡检", text="已有巡检在运行，请稍候。")
+            return
+
+        def run() -> None:
+            """后台执行巡检；没有低码条目时也回报一条结果。"""
+            try:
+                result = self._safe_low_bitrate_inspect()
+                if result.get("success") and not result.get("low"):
+                    self.post_message(
+                        mtype=None,
+                        title="码率优选巡检",
+                        text=f"最近 {self._inspect_days} 天更新的条目都不低于 {self._inspect_min_mbps:g} Mbps，无需处理。",
+                    )
+                elif not result.get("success"):
+                    self.post_message(
+                        mtype=None,
+                        title="码率优选巡检",
+                        text=f"巡检失败：{result.get('message', '未知错误')}",
+                    )
+            finally:
+                self._inspect_lock.release()
+
+        self.post_message(mtype=None, title="码率优选巡检", text="已开始巡检，完成后通知结果。")
+        threading.Thread(target=run, name="bitrateselector-inspect", daemon=True).start()
 
     def get_api(self) -> List[Dict[str, Any]]:
         """返回插件 API 列表。"""

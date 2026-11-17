@@ -73,7 +73,7 @@ _stub("app.sdk.logging", logger=NS(**{n: (lambda *a, **k: None) for n in ("info"
 _stub("app.sdk.media", Context=NS)
 _stub("app.schemas.event", ResourceDownloadEventData=object, ResourceSelectionEventData=object)
 _stub("app.schemas.media", resolve_media_identity=lambda media: (media.media_source, media.media_id))
-_stub("app.schemas.types", ChainEventType=NS(ResourceSelection=1, ResourceDownload=2), MediaType=MediaType)
+_stub("app.schemas.types", ChainEventType=NS(ResourceSelection=1, ResourceDownload=2), EventType=NS(PluginAction=5), MediaType=MediaType)
 
 _PATH = Path(__file__).resolve().parents[1] / "plugins.v3" / "bitrateselector" / "__init__.py"
 _spec = importlib.util.spec_from_file_location("bitrateselector", _PATH)
@@ -238,6 +238,38 @@ class MatchSubscribeTest(unittest.TestCase):
         self.assertIsNone(plugin._match_subscribe_id("星球", 1, subs))
 
 
+class InspectCommandTest(unittest.TestCase):
+    def test_command_runs_inspect_and_reports_clean(self):
+        plugin = make_plugin(_inspect_enabled=True, _inspect_days=30, _inspect_min_mbps=8.0)
+        plugin._safe_low_bitrate_inspect = lambda: {"success": True, "low": 0, "triggered": []}
+        threads = []
+        original = bs.threading.Thread
+
+        class _Sync:
+            def __init__(self, target, **_):
+                self.target = target
+
+            def start(self):
+                threads.append(self)
+                self.target()
+
+        bs.threading.Thread = _Sync
+        try:
+            plugin.on_plugin_action(NS(event_data={"action": "bitrate_inspect"}))
+        finally:
+            bs.threading.Thread = original
+        self.assertEqual(len(threads), 1)
+        self.assertIn("无需处理", plugin.messages[-1]["text"])
+        self.assertFalse(plugin._inspect_lock.locked())
+
+    def test_other_action_ignored_and_disabled_reported(self):
+        plugin = make_plugin(_inspect_enabled=False)
+        plugin.on_plugin_action(NS(event_data={"action": "mpstage_fix"}))
+        self.assertEqual(plugin.messages, [])
+        plugin.on_plugin_action(NS(event_data={"action": "bitrate_inspect"}))
+        self.assertIn("未启用", plugin.messages[-1]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -282,6 +314,38 @@ class NoticeTest(unittest.TestCase):
         label = bs.BitrateSelector._notify_version_label(
             NS(meta_info=NS(resource_team="ADWeb", resource_effect="HDR10 HDR"), torrent_info=NS(title="x")))
         self.assertEqual(label, "ADWeb · HDR10")
+
+
+class InspectCommandTest(unittest.TestCase):
+    def test_command_runs_inspect_and_reports_clean(self):
+        plugin = make_plugin(_inspect_enabled=True, _inspect_days=30, _inspect_min_mbps=8.0)
+        plugin._safe_low_bitrate_inspect = lambda: {"success": True, "low": 0, "triggered": []}
+        threads = []
+        original = bs.threading.Thread
+
+        class _Sync:
+            def __init__(self, target, **_):
+                self.target = target
+
+            def start(self):
+                threads.append(self)
+                self.target()
+
+        bs.threading.Thread = _Sync
+        try:
+            plugin.on_plugin_action(NS(event_data={"action": "bitrate_inspect"}))
+        finally:
+            bs.threading.Thread = original
+        self.assertEqual(len(threads), 1)
+        self.assertIn("无需处理", plugin.messages[-1]["text"])
+        self.assertFalse(plugin._inspect_lock.locked())
+
+    def test_other_action_ignored_and_disabled_reported(self):
+        plugin = make_plugin(_inspect_enabled=False)
+        plugin.on_plugin_action(NS(event_data={"action": "mpstage_fix"}))
+        self.assertEqual(plugin.messages, [])
+        plugin.on_plugin_action(NS(event_data={"action": "bitrate_inspect"}))
+        self.assertIn("未启用", plugin.messages[-1]["text"])
 
 
 if __name__ == "__main__":
