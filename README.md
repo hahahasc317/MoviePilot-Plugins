@@ -8,7 +8,7 @@ https://github.com/hahahasc317/MoviePilot-Plugins/raw/main/
 
 ## 插件列表
 
-### 码率优选（BitrateSelector）v1.4.1
+### 码率优选（BitrateSelector）v1.4.2
 
 下载前按「种子体积 × 8 ÷ 每集时长之和」估算候选资源码率（Mbps），自动优选高码率资源。
 

@@ -55,6 +55,9 @@ PATCH_TARGETS = {
     PATCH_PREPARE: ["subscribe", "context", "priority"],
     PATCH_PACK_GATE: ["subscribe", "priority"],
 }
+# 选种淘汰通知去重记录的存储键与去重时长
+SELECTION_NOTICE_KEY = "selection_notices"
+SELECTION_NOTICE_TTL_SECONDS = 24 * 3600
 # 补丁不兼容告警去重记录的存储键
 PATCH_ALERT_KEY = "patch_alert"
 
@@ -77,7 +80,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -476,11 +479,36 @@ class BitrateSelector(_PluginBase):
         data.source = "码率优选"
         logger.info(f"码率优选：淘汰 {len(dropped_logs)} 个低码率候选。{'；'.join(dropped_logs)}")
         if self._notify:
-            self.post_message(
-                mtype=None,
-                title="码率优选",
-                text="同覆盖低码候选已淘汰：\n" + "\n".join(dropped_notices[:5]),
-            )
+            fresh = self._dedupe_notices(dropped_notices)
+            if fresh:
+                self.post_message(
+                    mtype=None,
+                    title="码率优选",
+                    text="同覆盖低码候选已淘汰：\n" + "\n".join(fresh[:5]),
+                )
+
+    def _dedupe_notices(self, notices: List[str]) -> List[str]:
+        """
+        淘汰通知去重：同一剧集的同一组「淘汰版本 → 保留版本」24 小时内只通知一次。
+
+        订阅每轮搜索都会遇到同一批候选，码率数值随时长估算小幅波动，
+        去重键忽略码率数字，只看剧集与版本标签。
+        """
+        now = time.time()
+        sent: Dict[str, float] = {
+            key: ts
+            for key, ts in (self.get_data(SELECTION_NOTICE_KEY) or {}).items()
+            if now - float(ts) < SELECTION_NOTICE_TTL_SECONDS
+        }
+        fresh: List[str] = []
+        for notice in notices:
+            key = re.sub(r"\d+(?:\.\d+)?\s*Mbps", "", notice)
+            if key in sent:
+                continue
+            sent[key] = now
+            fresh.append(notice)
+        self.save_data(SELECTION_NOTICE_KEY, sent)
+        return fresh
 
     @eventmanager.register(ChainEventType.ResourceDownload)
     def on_resource_download(self, event: Event) -> None:

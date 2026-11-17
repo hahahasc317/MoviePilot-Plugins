@@ -240,3 +240,20 @@ class MatchSubscribeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoticeDedupeTest(unittest.TestCase):
+    def test_same_pair_notified_once_despite_bitrate_jitter(self):
+        plugin = make_plugin()
+        first = plugin._dedupe_notices(["玫瑰战争 S01：淘汰 OurTV 4.8Mbps → 保留 ADWeb 14.9Mbps"])
+        again = plugin._dedupe_notices(["玫瑰战争 S01：淘汰 OurTV 4.8Mbps → 保留 ADWeb 14.8Mbps"])
+        other = plugin._dedupe_notices(["折月亮 S01：淘汰 A 3.0Mbps → 保留 B 9.0Mbps"])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(again, [])
+        self.assertEqual(len(other), 1)
+
+    def test_expired_entry_notifies_again(self):
+        plugin = make_plugin()
+        key = "玫瑰战争 S01：淘汰 OurTV  → 保留 ADWeb "
+        plugin.save_data(bs.SELECTION_NOTICE_KEY, {key: time.time() - bs.SELECTION_NOTICE_TTL_SECONDS - 1})
+        self.assertEqual(len(plugin._dedupe_notices(["玫瑰战争 S01：淘汰 OurTV 4.8Mbps → 保留 ADWeb 14.9Mbps"])), 1)
