@@ -1,6 +1,7 @@
 import inspect
 import json
 import re
+import sys
 import threading
 import time
 import urllib.request
@@ -34,6 +35,28 @@ DEFAULT_LIBRARY_ROOT = "/media"
 INSPECT_THROTTLE_SECONDS = 24 * 3600
 # 低码巡检触发记录在插件数据中的存储键
 INSPECT_TRIGGERS_KEY = "inspect_triggers"
+# 低码巡检降级记录在插件数据中的存储键：{sid: {集号: {"ts": 降级时间, "cooldown": 冷却截止}}}
+INSPECT_DEMOTIONS_KEY = "inspect_demotions"
+# 核心「已完成洗版」的分集优先级（规则满分）与巡检降级后的待洗优先级
+FULL_EPISODE_PRIORITY = 100
+DEMOTED_EPISODE_PRIORITY = 99
+# 单轮巡检最多降级的集数，防止一次性放出大量洗版搜索
+INSPECT_MAX_DEMOTE_PER_ROUND = 20
+# 降级后未洗到更高码版本的恢复期限，以及恢复后同集的冷却期
+INSPECT_DEMOTE_TTL_SECONDS = 48 * 3600
+INSPECT_DEMOTE_COOLDOWN_SECONDS = 7 * 86400
+# 整包码率放行标记的存活时间（准入判定与下载提交在同一轮搜索内完成）
+WASH_MARK_TTL_SECONDS = 1800
+# 运行时补丁目标：(函数名, 期望参数列表)。MoviePilot 升级后签名一致即自动重新替换，
+# 不一致则该项功能自动停用并通知，绝不带病运行
+PATCH_PREPARE = "prepare_best_version_tv_candidate"
+PATCH_PACK_GATE = "should_prefer_full_pack_for_episode_best_version"
+PATCH_TARGETS = {
+    PATCH_PREPARE: ["subscribe", "context", "priority"],
+    PATCH_PACK_GATE: ["subscribe", "priority"],
+}
+# 补丁不兼容告警去重记录的存储键
+PATCH_ALERT_KEY = "patch_alert"
 
 
 class BitrateSelector(_PluginBase):
@@ -54,7 +77,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.3.1"
+    plugin_version = "1.4.0"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -72,6 +95,14 @@ class BitrateSelector(_PluginBase):
     _inspect_min_mbps = 8.0
     _inspect_days = 30
     _baselines: Dict[str, Dict[str, Any]] = {}
+    # 基线读改写锁：下载事件、播种线程、定时任务会并发修改 _baselines
+    _baseline_lock = threading.RLock()
+    # 播种互斥：同一时间只允许一个播种任务
+    _seed_lock = threading.Lock()
+    # 整包码率放行标记：{id(context): (时间, 种子标题, 可洗集合)}
+    _wash_marks: Dict[int, Tuple[float, str, Set[int]]] = {}
+    # 各补丁当前状态：{函数名: "active" / "incompatible:<原因>" / "missing"}
+    _patch_status: Dict[str, str] = {}
 
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """根据插件配置初始化运行开关与参数。"""
@@ -103,7 +134,9 @@ class BitrateSelector(_PluginBase):
             self._inspect_days = max(1, int(float(config.get("inspect_days") or 30)))
         except (TypeError, ValueError):
             self._inspect_days = 30
-        self._baselines = self.get_data(WASH_BASELINES_KEY) or {}
+        with self._baseline_lock:
+            self._baselines = self.get_data(WASH_BASELINES_KEY) or {}
+        self._wash_marks = {}
         self._apply_wash_patch()
         if self._wash_enabled:
             threading.Thread(
@@ -304,7 +337,9 @@ class BitrateSelector(_PluginBase):
                                                 "规则组仍负责资源资格筛选。开启后会扫描媒体库根目录下"
                                                 " P115StrmHelper 生成的 -mediainfo.json，为没有基线的剧集"
                                                 "播种实测码率，倍差超过 2 倍的异常基线自动按实测校正，"
-                                                "并每天 07:30 自动补充。"
+                                                "并每天 07:30 自动补充。规则同为满分的高码整包也按码率放行。"
+                                                "「低码巡检洗版」把实测低于门槛的满分集降为待洗再搜索，"
+                                                "48 小时内没洗到更高码则恢复并冷却 7 天，每轮最多 20 集。"
                                             ),
                                         },
                                     }
@@ -342,6 +377,34 @@ class BitrateSelector(_PluginBase):
                     "text": "码率优选已启用：批量下载前自动淘汰同覆盖范围的低码率候选。"
                     + ("洗版准入按估算码率优先。" if self._wash_enabled else ""),
                 },
+            },
+            *self._patch_status_page(),
+        ]
+
+    def _patch_status_page(self) -> List[Dict[str, Any]]:
+        """详情页展示运行时补丁状态与当前降级待洗记录数。"""
+        if not self._wash_enabled:
+            return []
+        labels = {PATCH_PREPARE: "洗版准入", PATCH_PACK_GATE: "整包门槛"}
+        rows = []
+        for name, state in (self._patch_status or {}).items():
+            text = "已接管" if state == "active" else f"未接管（{state}）"
+            rows.append(f"{labels.get(name, name)}：{text}")
+        demotions = self.get_data(INSPECT_DEMOTIONS_KEY) or {}
+        pending = sum(
+            1 for records in demotions.values() for rec in records.values() if rec.get("ts")
+        )
+        rows.append(f"巡检降级待洗：{pending} 集")
+        broken = any(state != "active" for state in (self._patch_status or {}).values())
+        return [
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "warning" if broken else "success",
+                    "variant": "tonal",
+                    "title": "运行时补丁（每次加载自动重新替换）",
+                    "text": "\n".join(rows),
+                },
             }
         ]
 
@@ -361,6 +424,16 @@ class BitrateSelector(_PluginBase):
                     "name": "码率基线库内播种",
                     "trigger": CronTrigger.from_crontab("30 7 * * *"),
                     "func": self._safe_seed_baselines,
+                    "kwargs": {},
+                }
+            )
+        if self._enabled and self._wash_enabled:
+            services.append(
+                {
+                    "id": "BitrateSelectorPatchWatchdog",
+                    "name": "码率优选补丁自检",
+                    "trigger": CronTrigger.from_crontab("*/30 * * * *"),
+                    "func": self._patch_watchdog,
                     "kwargs": {},
                 }
             )
@@ -471,58 +544,217 @@ class BitrateSelector(_PluginBase):
         return label
 
     def _apply_wash_patch(self) -> None:
-        """按配置安装或移除洗版准入的码率优先补丁。"""
+        """
+        按配置安装或移除码率优先洗版的运行时补丁。
+
+        插件每次加载（含 MoviePilot 升级重启后）都会自动重新替换；目标函数签名
+        与预期不一致时该项补丁不安装，相关功能自动停用并通知一次，保持核心原判定。
+        """
         if not (self._enabled and self._wash_enabled):
             self._remove_wash_patch()
             return
         module = subscription_priority
-        original = getattr(module, "prepare_best_version_tv_candidate", None)
-        if original is None:
-            logger.error("码率优选：未找到洗版准入函数，码率优先洗版未生效")
-            return
+        factories = {
+            PATCH_PREPARE: self._make_patched_prepare,
+            PATCH_PACK_GATE: self._make_patched_pack_gate,
+        }
+        status: Dict[str, str] = {}
+        for name, expected in PATCH_TARGETS.items():
+            current = getattr(module, name, None)
+            if current is None:
+                status[name] = "missing"
+                continue
+            if getattr(current, "_bitrateselector_wrapper", False):
+                original = getattr(current, "_bitrateselector_original", None)
+            else:
+                original = current
+            check = self._signature_check(original, expected)
+            if check:
+                status[name] = f"incompatible:{check}"
+                continue
+            wrapper = factories[name](original)
+            wrapper._bitrateselector_wrapper = True
+            wrapper._bitrateselector_original = original
+            setattr(module, name, wrapper)
+            status[name] = "active"
+        self._patch_status = status
+        broken = {name: state for name, state in status.items() if state != "active"}
+        if broken:
+            self._alert_patch_incompatible(broken)
+        logger.info(
+            "码率优选：运行时补丁状态 "
+            + "，".join(f"{name}={state}" for name, state in status.items())
+        )
+
+    @staticmethod
+    def _signature_check(func: Any, expected: List[str]) -> str:
+        """校验目标函数参数列表，一致返回空串，否则返回不一致说明。"""
+        if func is None or not callable(func):
+            return "不可调用"
         try:
-            params = list(inspect.signature(original).parameters)
+            params = list(inspect.signature(func).parameters)
         except (TypeError, ValueError):
-            params = []
-        if params != ["subscribe", "context", "priority"]:
-            logger.error(
-                f"码率优选：洗版准入函数签名变化（{params}），"
-                f"码率优先洗版未生效，请检查 MoviePilot 版本兼容性"
-            )
+            return "无法读取签名"
+        if params != expected:
+            return f"签名变为 {params}"
+        return ""
+
+    def _alert_patch_incompatible(self, broken: Dict[str, str]) -> None:
+        """补丁不兼容时按「MoviePilot 版本 + 不兼容详情」去重通知一次。"""
+        try:
+            from app.runtime.config import settings  # pylint: disable=import-outside-toplevel
+
+            version = str(getattr(settings, "VERSION_FLAG", "") or getattr(settings, "APP_VERSION", "") or "")
+        except Exception:
+            version = ""
+        signature = f"{version}|" + "|".join(f"{k}={v}" for k, v in sorted(broken.items()))
+        if self.get_data(PATCH_ALERT_KEY) == signature:
             return
-        if not getattr(module, "_bitrateselector_original_prepare", None):
-            module._bitrateselector_original_prepare = original
-        module.prepare_best_version_tv_candidate = self._make_patched_prepare(module)
-        module._bitrateselector_patched_by = self.__class__.__name__
-        logger.info("码率优选：洗版准入已切换为估算码率优先，规则优先级基线不再参与洗版判定")
+        self.save_data(PATCH_ALERT_KEY, signature)
+        detail = "；".join(f"{k}：{v}" for k, v in broken.items())
+        logger.error(f"码率优选：MoviePilot 内部函数与插件预期不一致，相关功能已自动停用：{detail}")
+        if self._notify:
+            self.post_message(
+                mtype=None,
+                title="码率优选补丁失效",
+                text=(
+                    "MoviePilot 升级后内部函数发生变化，以下补丁未安装，"
+                    f"对应功能已停用并回退核心原判定：\n{detail}\n请更新码率优选插件。"
+                ),
+            )
+
+    def _patch_watchdog(self) -> None:
+        """定时自检：补丁被热重载或其他插件覆盖时自动重新替换。"""
+        if not (self._enabled and self._wash_enabled):
+            return
+        module = subscription_priority
+        lost = [
+            name
+            for name, state in self._patch_status.items()
+            if state == "active"
+            and not getattr(getattr(module, name, None), "_bitrateselector_wrapper", False)
+        ]
+        if lost:
+            logger.warning(f"码率优选：补丁被覆盖或模块重载（{lost}），重新替换")
+            self._apply_wash_patch()
 
     def _remove_wash_patch(self) -> None:
-        """移除洗版准入补丁并还原原始判定函数。"""
+        """移除全部运行时补丁并还原原始函数。"""
         module = subscription_priority
-        original = getattr(module, "_bitrateselector_original_prepare", None)
-        if original is None:
-            return
-        module.prepare_best_version_tv_candidate = original
-        del module._bitrateselector_original_prepare
+        restored = []
+        for name in PATCH_TARGETS:
+            current = getattr(module, name, None)
+            if getattr(current, "_bitrateselector_wrapper", False):
+                setattr(module, name, current._bitrateselector_original)
+                restored.append(name)
+        # 兼容 1.3.x 以前的补丁存放方式
+        legacy = getattr(module, "_bitrateselector_original_prepare", None)
+        if legacy is not None:
+            module.prepare_best_version_tv_candidate = legacy
+            del module._bitrateselector_original_prepare
+            restored.append(PATCH_PREPARE)
         if hasattr(module, "_bitrateselector_patched_by"):
             del module._bitrateselector_patched_by
-        logger.info("码率优选：洗版准入补丁已移除，恢复规则优先级判定")
+        self._patch_status = {}
+        if restored:
+            logger.info(f"码率优选：运行时补丁已移除，恢复核心判定（{sorted(set(restored))}）")
 
-    def _make_patched_prepare(self, module: Any):
+    def _make_patched_prepare(self, original: Any):
         """构造替换洗版准入函数的闭包，判定异常时回退原始规则优先级。"""
 
         def patched(subscribe: Any, context: Any, priority: int) -> bool:
             """按估算码率执行洗版准入，异常时回退原始判定。"""
-            original = getattr(module, "_bitrateselector_original_prepare", None)
             try:
                 return self._wash_admit(subscribe, context, priority, original)
             except Exception as err:
                 logger.warning(f"码率优选：码率优先洗版判定异常，本次回退规则优先级：{err}")
-                if original is not None:
-                    return original(subscribe, context, priority)
+                return original(subscribe, context, priority)
+
+        return patched
+
+    def _make_patched_pack_gate(self, original: Any):
+        """
+        构造替换整包准入门槛的闭包。
+
+        核心要求整包规则优先级严格高于每个目标集；规则同为满分时高码整包永远被拒。
+        原判定拒绝时，若该整包在本轮准入中已被插件按码率核验为可洗（存在高于基线
+        领先比例的集），则放行；实际下载集数仍由核心与候选允许集数取交集限定。
+        """
+
+        def patched(subscribe: Any, priority: int) -> bool:
+            """先走原判定；被拒时按本轮码率准入标记放行整包。"""
+            accepted = original(subscribe, priority)
+            if accepted:
+                return True
+            try:
+                if not (self._enabled and self._wash_enabled):
+                    return False
+                if not getattr(subscribe, "best_version", False):
+                    return False
+                if subscription_priority.is_full_best_version_enabled(subscribe):
+                    return False
+                context = self._find_caller_context(priority)
+                if context is None:
+                    return False
+                washable = self._wash_mark_for(context)
+                if not washable:
+                    return False
+                title = (getattr(context.torrent_info, "title", "") or "")[:60]
+                logger.info(
+                    f"码率优选：整包规则优先级未高于已有集，但码率可提升 "
+                    f"{self._compress_episode_ranges(sorted(washable))}，放行整包（{title}）"
+                )
+                return True
+            except Exception as err:
+                logger.warning(f"码率优选：整包码率放行判定异常，保持核心原判定：{err}")
                 return False
 
         return patched
+
+    @staticmethod
+    def _find_caller_context(priority: Any, max_depth: int = 8) -> Optional[Any]:
+        """
+        沿调用栈查找正在被整包门槛判定的候选上下文。
+
+        核心门槛函数只接收 (subscribe, priority)，候选位于调用方循环的局部变量
+        context 中；按 torrent_info.pri_order 与 priority 一致校验，找不到返回 None。
+        """
+        frame = sys._getframe(1)  # pylint: disable=protected-access
+        try:
+            depth = 0
+            while frame is not None and depth < max_depth:
+                candidate = frame.f_locals.get("context")
+                torrent = getattr(candidate, "torrent_info", None)
+                if torrent is not None and getattr(torrent, "pri_order", None) == priority:
+                    return candidate
+                frame = frame.f_back
+                depth += 1
+            return None
+        finally:
+            del frame
+
+    def _mark_wash_candidate(self, context: Any, washable: List[int]) -> None:
+        """记录本轮按码率核验可洗的候选，供整包门槛放行使用。"""
+        now = time.time()
+        marks = self._wash_marks
+        for key in [k for k, v in marks.items() if now - v[0] > WASH_MARK_TTL_SECONDS]:
+            marks.pop(key, None)
+        title = str(getattr(getattr(context, "torrent_info", None), "title", "") or "")
+        if washable:
+            marks[id(context)] = (now, title, set(washable))
+        else:
+            marks.pop(id(context), None)
+
+    def _wash_mark_for(self, context: Any) -> Set[int]:
+        """读取候选的可洗集合；对象 id 复用或过期时返回空集。"""
+        mark = self._wash_marks.get(id(context))
+        if not mark:
+            return set()
+        ts, title, washable = mark
+        current_title = str(getattr(getattr(context, "torrent_info", None), "title", "") or "")
+        if time.time() - ts > WASH_MARK_TTL_SECONDS or title != current_title:
+            return set()
+        return washable
 
     def _wash_admit(
         self, subscribe: Any, context: Any, priority: int, original: Any
@@ -667,6 +899,7 @@ class BitrateSelector(_PluginBase):
                 )
             ]
             interested = sorted(set(washable) | set(pending_new))
+            washable_eps = list(washable)
         else:
             interested = []
             skipped_known = 0
@@ -698,7 +931,9 @@ class BitrateSelector(_PluginBase):
                 logger.debug(
                     f"码率优选：{len(pending_new)} 集库内未下载，按初始补缺放行"
                 )
+            washable_eps = list(interested)
             interested = sorted(set(interested) | set(pending_new))
+        self._mark_wash_candidate(context, washable_eps)
         if interested:
             episode_range = (
                 f"E{interested[0]}" if len(interested) == 1
@@ -796,6 +1031,7 @@ class BitrateSelector(_PluginBase):
             )
             return
         try:
+            self._baseline_lock.acquire()
             entry = self._baselines.setdefault(key, {})
             new_value = round(bitrate, 2)
             refused: List[str] = []
@@ -845,6 +1081,8 @@ class BitrateSelector(_PluginBase):
         except Exception as err:
             logger.error(f"码率优选：保存码率基线失败：{err}")
             return
+        finally:
+            self._baseline_lock.release()
         if refused:
             shown = "；".join(refused[:8]) + ("等" if len(refused) > 8 else "")
             logger.warning(
@@ -904,12 +1142,18 @@ class BitrateSelector(_PluginBase):
         return None
 
     def _safe_seed_baselines(self) -> Dict[str, Any]:
-        """执行库内播种并吞掉异常，返回结果摘要。"""
+        """执行库内播种并吞掉异常，返回结果摘要；已有播种在跑时直接跳过。"""
+        if not self._seed_lock.acquire(blocking=False):
+            logger.info("码率优选：已有库内播种在运行，本次跳过")
+            return {"success": False, "seeded": 0, "message": "播种进行中"}
         try:
-            return self.seed_baselines_from_library()
+            with self._baseline_lock:
+                return self.seed_baselines_from_library()
         except Exception as err:
             logger.error(f"码率优选：库内基线播种失败：{err}")
             return {"success": False, "seeded": 0, "message": str(err)}
+        finally:
+            self._seed_lock.release()
 
     def _safe_low_bitrate_inspect(self) -> Dict[str, Any]:
         """执行低码巡检并吞掉异常，返回结果摘要。"""
@@ -928,21 +1172,39 @@ class BitrateSelector(_PluginBase):
     def _match_subscribe_id(
         self, dir_name: str, season_num: int, subscriptions: List[Any]
     ) -> Optional[Any]:
-        """按目录名与季号匹配在订订阅，返回订阅 ID 或 None。"""
+        """
+        按目录名、年份与季号匹配在订订阅，返回订阅对象或 None。
+
+        优先剧名完全相等；目录名带年份时要求订阅年份一致。只有唯一一个
+        包含关系候选时才接受模糊匹配，避免短剧名误触发其他订阅。
+        """
         normalized = self._parse_show_dir_name(dir_name)
         if not normalized:
             return None
+        year_match = re.search(r"\((\d{4})\)\s*$", str(dir_name or ""))
+        dir_year = year_match.group(1) if year_match else ""
+        exact: List[Any] = []
+        fuzzy: List[Any] = []
         for subscribe in subscriptions:
             name = self._parse_show_dir_name(str(getattr(subscribe, "name", "") or ""))
             if not name:
                 continue
-            if name == normalized or name in normalized or normalized in name:
-                subscribe_season = getattr(subscribe, "season", None) or 1
-                try:
-                    if int(subscribe_season or 1) == int(season_num):
-                        return getattr(subscribe, "id", None)
-                except (TypeError, ValueError):
+            try:
+                if int(getattr(subscribe, "season", None) or 1) != int(season_num):
                     continue
+            except (TypeError, ValueError):
+                continue
+            sub_year = str(getattr(subscribe, "year", "") or "")
+            if dir_year and sub_year and dir_year != sub_year:
+                continue
+            if name == normalized:
+                exact.append(subscribe)
+            elif name in normalized or normalized in name:
+                fuzzy.append(subscribe)
+        if exact:
+            return exact[0]
+        if len(fuzzy) == 1:
+            return fuzzy[0]
         return None
 
     def _scan_low_bitrate_items(self, cutoff: float) -> Dict[str, Dict[str, Any]]:
@@ -1039,60 +1301,214 @@ class BitrateSelector(_PluginBase):
             episodes_text = "未知集"
         return f"{group.get('label', '未知剧集')}：{episodes_text}{range_text}"
 
+    @staticmethod
+    def _plan_demotions(
+        episode_priority: Dict[str, int],
+        low_episodes: List[int],
+        baselines: Dict[str, Any],
+        records: Dict[str, Any],
+        now: float,
+        budget: int,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """
+        规划单个订阅的低码集降级。
+
+        :return: (需降级为待洗的集, 已处于待洗的集, 跳过的集)
+                 只降级规则满分（核心视为洗版完成）、已有码率基线、不在冷却期的集；
+                 没有基线的集降级后插件无从比较码率，会退化为规则判定，故跳过。
+        """
+        demote: List[int] = []
+        pending: List[int] = []
+        skipped: List[int] = []
+        for episode in sorted(set(low_episodes)):
+            key = str(episode)
+            priority = episode_priority.get(key)
+            record = records.get(key) or {}
+            if priority is None:
+                skipped.append(episode)
+                continue
+            if priority < FULL_EPISODE_PRIORITY:
+                pending.append(episode)
+                continue
+            if baselines.get(key) is None:
+                skipped.append(episode)
+                continue
+            if float(record.get("cooldown", 0) or 0) > now:
+                skipped.append(episode)
+                continue
+            if len(demote) >= budget:
+                skipped.append(episode)
+                continue
+            demote.append(episode)
+        return demote, pending, skipped
+
+    @staticmethod
+    def _plan_restores(
+        episode_priority: Dict[str, int], records: Dict[str, Any], now: float
+    ) -> Tuple[List[int], List[int]]:
+        """
+        规划降级记录的恢复与清理。
+
+        :return: (超时仍停在降级优先级、需恢复满分的集, 已被洗版改写、可清理记录的集)
+        """
+        restore: List[int] = []
+        finished: List[int] = []
+        for key, record in records.items():
+            try:
+                episode = int(key)
+            except (TypeError, ValueError):
+                continue
+            if record.get("cooldown"):
+                if float(record["cooldown"]) <= now:
+                    finished.append(episode)
+                continue
+            priority = episode_priority.get(key)
+            if priority != DEMOTED_EPISODE_PRIORITY:
+                finished.append(episode)
+            elif now - float(record.get("ts", 0) or 0) >= INSPECT_DEMOTE_TTL_SECONDS:
+                restore.append(episode)
+        return sorted(restore), sorted(finished)
+
+    @staticmethod
+    def _write_episode_priority(sid: Any, episode_priority: Dict[str, int]) -> None:
+        """在独立短事务中写回订阅分集优先级。"""
+        from app.db.session import SessionFactory  # pylint: disable=import-outside-toplevel
+
+        with SessionFactory() as session:
+            SubscribeOper(session).update(int(sid), {"episode_priority": dict(episode_priority)})
+            session.commit()
+
+    def _restore_expired_demotions(
+        self, subscriptions: Dict[str, Any], demotions: Dict[str, Any], now: float
+    ) -> List[str]:
+        """恢复超时未洗成的降级集为满分并进入冷却，返回通知行。"""
+        rows: List[str] = []
+        for sid, records in list(demotions.items()):
+            subscribe = subscriptions.get(sid)
+            if subscribe is None:
+                demotions.pop(sid, None)
+                continue
+            priority_map = dict(subscription_priority.get_episode_priority(subscribe))
+            restore, finished = self._plan_restores(priority_map, records, now)
+            for episode in finished:
+                records.pop(str(episode), None)
+            if restore:
+                for episode in restore:
+                    priority_map[str(episode)] = FULL_EPISODE_PRIORITY
+                try:
+                    self._write_episode_priority(sid, priority_map)
+                except Exception as err:
+                    logger.error(f"码率优选：恢复订阅 {sid} 分集优先级失败：{err}")
+                    continue
+                for episode in restore:
+                    records[str(episode)] = {"cooldown": now + INSPECT_DEMOTE_COOLDOWN_SECONDS}
+                label = self._compress_episode_ranges(restore)
+                rows.append(f"· {getattr(subscribe, 'name', sid)} {label}")
+                logger.info(
+                    f"码率优选：订阅 {sid} {label} 降级 48 小时内未洗到更高码，恢复满分，7 天内不再降级"
+                )
+            if not records:
+                demotions.pop(sid, None)
+        return rows
+
     def _low_bitrate_inspect(self) -> Dict[str, Any]:
         """
-        巡检媒体库低码集，并对匹配的在订订阅自动触发订阅搜索洗版。
+        巡检媒体库低码集，让在订洗版订阅重新搜索这些集。
 
-        搜索由订阅规则组与码率优选准入把关，只会补缺或升级到更高码版本；
-        同一订阅 24 小时内只触发一次，避免无高码资源时反复搜索。
+        核心按规则优先级判定洗版完成：满分（100）的集永不再搜。对开启洗版的
+        分集订阅，把实测低于门槛、已有码率基线的满分集降为 99 使其重新待洗，
+        再触发订阅搜索；能否替换仍由码率优先准入把关（须领先基线设定比例）。
+        48 小时内未洗到更高码的集恢复满分并冷却 7 天。未开洗版或全集洗版的
+        订阅只通知不处理。
         """
         if not (self._enabled and self._inspect_enabled):
             return {"success": False, "low": 0, "triggered": [], "message": "插件或低码巡检未启用"}
-        cutoff = time.time() - max(1, self._inspect_days) * 86400
-        low_groups = self._scan_low_bitrate_items(cutoff)
-        if not low_groups:
-            logger.info("码率优选：低码巡检完成，最近更新条目均高于门槛")
-            if self._notify:
-                self.post_message(
-                    mtype=None,
-                    title="码率优选巡检",
-                    text="近期新增/更新的媒体条目均高于低码门槛。",
-                )
-            return {"success": True, "low": 0, "triggered": []}
-        subscriptions = [
+        now = time.time()
+        all_tv = [
             subscribe
             for subscribe in (SubscribeOper().list() or [])
             if getattr(subscribe, "type", None) == MediaType.TV.value
         ]
+        by_sid = {str(getattr(sub, "id", "")): sub for sub in all_tv}
+        demotions: Dict[str, Any] = self.get_data(INSPECT_DEMOTIONS_KEY) or {}
+        restored_rows = self._restore_expired_demotions(by_sid, demotions, now)
+        if self._wash_enabled:
+            self._safe_seed_baselines()
+        cutoff = now - max(1, self._inspect_days) * 86400
+        low_groups = self._scan_low_bitrate_items(cutoff)
+        if not low_groups and not restored_rows:
+            self.save_data(INSPECT_DEMOTIONS_KEY, demotions)
+            logger.info("码率优选：低码巡检完成，最近更新条目均高于门槛")
+            return {"success": True, "low": 0, "triggered": []}
         triggers = self.get_data(INSPECT_TRIGGERS_KEY) or {}
-        now = time.time()
+        budget = INSPECT_MAX_DEMOTE_PER_ROUND
         triggered_rows: List[str] = []
         triggered_labels: List[str] = []
         throttled_rows: List[str] = []
+        idle_rows: List[str] = []
+        not_wash_rows: List[str] = []
         unmatched_rows: List[str] = []
         failed_rows: List[str] = []
         for group in low_groups.values():
             season_num = group.get("season", 1)
             summary = self._low_bitrate_group_summary(group)
-            sid = self._match_subscribe_id(group["label"], season_num, subscriptions)
-            if not sid:
+            subscribe = self._match_subscribe_id(group["label"], season_num, all_tv)
+            if subscribe is None:
                 unmatched_rows.append(f"· {summary}")
                 continue
-            if now - float(triggers.get(str(sid), 0)) < INSPECT_THROTTLE_SECONDS:
+            sid = str(getattr(subscribe, "id", ""))
+            if (
+                not getattr(subscribe, "best_version", False)
+                or subscription_priority.is_full_best_version_enabled(subscribe)
+                or not self._wash_enabled
+            ):
+                not_wash_rows.append(f"· {summary}")
+                continue
+            priority_map = dict(subscription_priority.get_episode_priority(subscribe))
+            baselines = self._wash_baseline_entry(subscribe).get("episodes") or {}
+            records = demotions.setdefault(sid, {})
+            demote, pending, skipped = self._plan_demotions(
+                priority_map, list(group.get("eps", {}).keys()), baselines, records, now, budget
+            )
+            if demote:
+                for episode in demote:
+                    priority_map[str(episode)] = DEMOTED_EPISODE_PRIORITY
+                try:
+                    self._write_episode_priority(sid, priority_map)
+                except Exception as err:
+                    logger.error(f"码率优选：低码巡检降级订阅 {sid} 失败：{err}")
+                    failed_rows.append(f"· {summary}（降级失败：{err}）")
+                    continue
+                for episode in demote:
+                    records[str(episode)] = {"ts": now}
+                budget -= len(demote)
+                logger.info(
+                    f"码率优选：低码巡检将订阅 {sid}（{group['label']}）"
+                    f"{self._compress_episode_ranges(demote)} 降为待洗"
+                )
+            if not records:
+                demotions.pop(sid, None)
+            if not demote and not pending:
+                reason = "已在冷却期或缺基线" if skipped else "无可洗集"
+                idle_rows.append(f"· {summary}（{reason}）")
+                continue
+            if not demote and now - float(triggers.get(sid, 0)) < INSPECT_THROTTLE_SECONDS:
                 throttled_rows.append(f"· {summary}")
                 continue
             try:
-                SubscribeChain().search(sid=sid, manual=True)
+                SubscribeChain().search(sid=int(sid), manual=True)
             except Exception as err:
                 logger.error(f"码率优选：低码巡检触发订阅搜索失败（sid={sid}）：{err}")
                 failed_rows.append(f"· {summary}（触发失败：{err}）")
                 continue
-            triggers[str(sid)] = now
+            triggers[sid] = now
             triggered_labels.append(group["label"])
-            triggered_rows.append(f"· {summary}")
-            logger.info(
-                f"码率优选：低码巡检触发订阅搜索洗版 sid={sid}（{group['label']}）"
+            washing = sorted(set(demote) | set(pending))
+            triggered_rows.append(
+                f"· {group['label']}：{self._compress_episode_ranges(washing)} 待洗"
             )
+            logger.info(f"码率优选：低码巡检触发订阅搜索洗版 sid={sid}（{group['label']}）")
+        self.save_data(INSPECT_DEMOTIONS_KEY, demotions)
         if triggered_labels:
             self.save_data(INSPECT_TRIGGERS_KEY, triggers)
         logger.info(
@@ -1102,23 +1518,29 @@ class BitrateSelector(_PluginBase):
         if self._notify:
             lines: List[str] = []
             if triggered_rows:
-                lines.append(f"发现低码集，已自动触发 {len(triggered_rows)} 部在订剧集的洗版搜索：")
-                lines.extend(triggered_rows)
-            if throttled_rows:
-                lines.append("以下今日已触发过洗版搜索，本轮跳过：")
-                lines.extend(throttled_rows[:4])
+                lines.append(f"已让 {len(triggered_rows)} 部剧的低码集重新待洗并触发搜索：")
+                lines.extend(triggered_rows[:8])
+            if restored_rows:
+                lines.append("以下降级 48 小时内未找到更高码版本，已恢复并冷却 7 天：")
+                lines.extend(restored_rows[:6])
             if failed_rows:
-                lines.append("以下触发失败，请留意：")
+                lines.append("以下处理失败，请留意：")
                 lines.extend(failed_rows[:4])
+            if not_wash_rows:
+                lines.append("以下订阅未开启分集洗版，不自动处理：")
+                lines.extend(not_wash_rows[:6])
             if unmatched_rows:
                 lines.append("以下剧集未订阅，不自动处理：")
                 lines.extend(unmatched_rows[:6])
-            self.post_message(mtype=None, title="码率优选巡检", text="\n".join(lines))
+            if lines:
+                self.post_message(mtype=None, title="码率优选巡检", text="\n".join(lines))
         return {
             "success": True,
             "low": len(low_groups),
             "triggered": triggered_labels,
             "throttled": len(throttled_rows),
+            "idle": len(idle_rows),
+            "not_wash": len(not_wash_rows),
             "unmatched": len(unmatched_rows),
         }
 
