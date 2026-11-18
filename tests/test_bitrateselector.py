@@ -470,6 +470,70 @@ class TransferBaselineTest(unittest.TestCase):
                                round(6 * 1024 ** 3 * 8 / 2700 / 1e6, 2))
 
 
+class GraduationTest(unittest.TestCase):
+    def test_plan_graduation(self):
+        now = 1_000_000
+        day = 86400
+        priority = {"1": 96, "2": 96, "3": 96, "4": 100, "5": 94, "6": 0, "7": 96}
+        baselines = {"1": 16.0, "2": 16.0, "3": 12.0, "4": 16.0, "5": 18.5, "6": 16.0, "7": 16.0}
+        watch = {
+            "1": {"ts": now - 3 * day - 1, "mbps": 16.0},   # 观察满 3 天、未提升 → 毕业
+            "2": {"ts": now - 1 * day, "mbps": 16.0},       # 观察未满 → 继续
+            "5": {"ts": now - 5 * day, "mbps": 15.0},       # 期间洗到 +23% → 重新计时
+        }
+        graduate, new_watch = bs.BitrateSelector._plan_graduation(
+            priority, baselines, watch, now, 0.15, excluded={"7"})
+        self.assertEqual(graduate, [1])
+        self.assertEqual(new_watch["2"], watch["2"])
+        self.assertEqual(new_watch["5"], {"ts": now, "mbps": 18.5})
+        self.assertNotIn("3", new_watch)   # 码率未达标
+        self.assertNotIn("4", new_watch)   # 已满分
+        self.assertNotIn("6", new_watch)   # 未下载
+        self.assertNotIn("7", new_watch)   # 巡检降级中
+
+    def test_idle_reason(self):
+        plugin = make_plugin()
+        now = time.time()
+        text = plugin._idle_reason(
+            {"1": 100, "2": 100, "3": 100}, [1, 2, 9], {"1": 5.0}, {"1": {"cooldown": now + 86400}}, now)
+        self.assertIn("E1 近期洗过未找到更好版本", text)
+        self.assertIn("E2 缺码率基线", text)
+        self.assertIn("E9 订阅无下载记录", text)
+
+
+class MediainfoMetricTest(unittest.TestCase):
+    def test_total_bitrate_includes_audio(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x-mediainfo.json"
+            size = 6 * 1024 ** 3
+            path.write_text(json.dumps([{"MediaSourceInfo": {
+                "Size": size, "RunTimeTicks": 45 * 60 * 10_000_000, "Bitrate": 1,
+                "MediaStreams": [{"Type": "Video", "BitRate": 15_000_000}]}}]))
+            self.assertAlmostEqual(make_plugin()._mediainfo_bitrate_mbps(path),
+                                   round(size * 8 / 2700 / 1e6, 2))
+            path.write_text(json.dumps([{"MediaSourceInfo": {
+                "MediaStreams": [{"Type": "Video", "BitRate": 15_000_000}]}}]))
+            self.assertEqual(make_plugin()._mediainfo_bitrate_mbps(path), 15.0)
+
+
+class LocalShadowTest(unittest.TestCase):
+    def test_detects_and_alerts_once(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os_path = Path(tmp) / "bitrateselector"
+            os_path.mkdir()
+            _stub("app.core", )
+            _stub("app.core.config", settings=NS(PLUGIN_LOCAL_REPO_PATHS=tmp))
+            plugin = make_plugin(plugin_name="码率优选")
+            self.assertEqual(plugin._check_local_shadow(), [str(os_path)])
+            plugin._check_local_shadow()
+            self.assertEqual(len(plugin.messages), 1)
+            os_path.rmdir()
+            self.assertEqual(plugin._check_local_shadow(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -746,6 +810,70 @@ class TransferBaselineTest(unittest.TestCase):
         plugin.on_transfer_complete(NS(event_data=self._event(6 * 1024 ** 3)))
         self.assertAlmostEqual(plugin._baselines["themoviedb:279155:1"]["episodes"]["1"],
                                round(6 * 1024 ** 3 * 8 / 2700 / 1e6, 2))
+
+
+class GraduationTest(unittest.TestCase):
+    def test_plan_graduation(self):
+        now = 1_000_000
+        day = 86400
+        priority = {"1": 96, "2": 96, "3": 96, "4": 100, "5": 94, "6": 0, "7": 96}
+        baselines = {"1": 16.0, "2": 16.0, "3": 12.0, "4": 16.0, "5": 18.5, "6": 16.0, "7": 16.0}
+        watch = {
+            "1": {"ts": now - 3 * day - 1, "mbps": 16.0},   # 观察满 3 天、未提升 → 毕业
+            "2": {"ts": now - 1 * day, "mbps": 16.0},       # 观察未满 → 继续
+            "5": {"ts": now - 5 * day, "mbps": 15.0},       # 期间洗到 +23% → 重新计时
+        }
+        graduate, new_watch = bs.BitrateSelector._plan_graduation(
+            priority, baselines, watch, now, 0.15, excluded={"7"})
+        self.assertEqual(graduate, [1])
+        self.assertEqual(new_watch["2"], watch["2"])
+        self.assertEqual(new_watch["5"], {"ts": now, "mbps": 18.5})
+        self.assertNotIn("3", new_watch)   # 码率未达标
+        self.assertNotIn("4", new_watch)   # 已满分
+        self.assertNotIn("6", new_watch)   # 未下载
+        self.assertNotIn("7", new_watch)   # 巡检降级中
+
+    def test_idle_reason(self):
+        plugin = make_plugin()
+        now = time.time()
+        text = plugin._idle_reason(
+            {"1": 100, "2": 100, "3": 100}, [1, 2, 9], {"1": 5.0}, {"1": {"cooldown": now + 86400}}, now)
+        self.assertIn("E1 近期洗过未找到更好版本", text)
+        self.assertIn("E2 缺码率基线", text)
+        self.assertIn("E9 订阅无下载记录", text)
+
+
+class MediainfoMetricTest(unittest.TestCase):
+    def test_total_bitrate_includes_audio(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "x-mediainfo.json"
+            size = 6 * 1024 ** 3
+            path.write_text(json.dumps([{"MediaSourceInfo": {
+                "Size": size, "RunTimeTicks": 45 * 60 * 10_000_000, "Bitrate": 1,
+                "MediaStreams": [{"Type": "Video", "BitRate": 15_000_000}]}}]))
+            self.assertAlmostEqual(make_plugin()._mediainfo_bitrate_mbps(path),
+                                   round(size * 8 / 2700 / 1e6, 2))
+            path.write_text(json.dumps([{"MediaSourceInfo": {
+                "MediaStreams": [{"Type": "Video", "BitRate": 15_000_000}]}}]))
+            self.assertEqual(make_plugin()._mediainfo_bitrate_mbps(path), 15.0)
+
+
+class LocalShadowTest(unittest.TestCase):
+    def test_detects_and_alerts_once(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os_path = Path(tmp) / "bitrateselector"
+            os_path.mkdir()
+            _stub("app.core", )
+            _stub("app.core.config", settings=NS(PLUGIN_LOCAL_REPO_PATHS=tmp))
+            plugin = make_plugin(plugin_name="码率优选")
+            self.assertEqual(plugin._check_local_shadow(), [str(os_path)])
+            plugin._check_local_shadow()
+            self.assertEqual(len(plugin.messages), 1)
+            os_path.rmdir()
+            self.assertEqual(plugin._check_local_shadow(), [])
 
 
 if __name__ == "__main__":

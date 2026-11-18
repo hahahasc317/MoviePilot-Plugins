@@ -6,6 +6,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.chain.tmdb import TmdbChain
@@ -70,6 +71,14 @@ TITLE_EP_RANGE_RE = re.compile(
     r"(?:\bE[Pp]?|第)\s*(\d{1,4})\s*(?:-|~|～|—|至)\s*(?:E[Pp]?)?\s*(\d{1,4})", re.IGNORECASE
 )
 TITLE_EP_TOTAL_RE = re.compile(r"[全共]\s*(\d{1,4})\s*集")
+# 库内实测与基线相差超过该比例即重新校准（统一为含音轨的整体码率口径）
+SEED_RECALIBRATE_TOLERANCE = 0.05
+# 洗版毕业：码率达标且观察期内未洗到明显更好版本的集，标记为规则满分停止洗版
+GRADUATE_MIN_MBPS = 15.0
+GRADUATE_WATCH_SECONDS = 3 * 86400
+GRADUATION_KEY = "graduation_watch"
+# 本地插件副本告警去重记录
+LOCAL_SHADOW_KEY = "local_shadow_alert"
 # 入库实测：视频文件最小体积与扩展名
 TRANSFER_MIN_VIDEO_BYTES = 50 * 1024 * 1024
 VIDEO_EXTS = (".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".wmv", ".flv", ".iso", ".rmvb", ".webm")
@@ -100,7 +109,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -126,13 +135,63 @@ class BitrateSelector(_PluginBase):
     _inspect_lock = threading.Lock()
     # 本次播种剩余的 strm 核实额度
     _seed_verify_budget = 0
+    # 最近一次巡检中「边车低码但实际文件已是高码」被忽略的条目数
+    _last_scan_stale = 0
     # 整包码率放行标记：{id(context): (时间, 种子标题, 可洗集合)}
     _wash_marks: Dict[int, Tuple[float, str, Set[int]]] = {}
     # 各补丁当前状态：{函数名: "active" / "incompatible:<原因>" / "missing"}
     _patch_status: Dict[str, str] = {}
 
+    def _check_local_shadow(self) -> List[str]:
+        """
+        检查本地插件目录中是否存在本插件的同名副本。
+
+        MoviePilot 会优先加载本地副本，插件市场的更新因此不生效（安装提示成功但仍运行旧版）。
+        发现副本时按路径去重通知一次，返回发现的路径列表。
+        """
+        roots: List[str] = []
+        try:
+            from app.core.config import settings  # pylint: disable=import-outside-toplevel
+
+            raw = getattr(settings, "PLUGIN_LOCAL_REPO_PATHS", "") or ""
+            roots = [part.strip() for part in str(raw).replace(";", ",").split(",") if part.strip()]
+        except Exception:
+            roots = []
+        if not roots:
+            roots = ["/config/local-plugins"]
+        plugin_dir = self.__class__.__name__.lower()
+        found: List[str] = []
+        for root in roots:
+            for sub in ("", "plugins.v3", "plugins.v2", "plugins"):
+                candidate = os.path.join(root, sub, plugin_dir) if sub else os.path.join(root, plugin_dir)
+                if os.path.isdir(candidate):
+                    found.append(candidate)
+        if not found:
+            return []
+        signature = "|".join(sorted(found))
+        try:
+            if self.get_data("local_shadow_alert") != signature:
+                self.save_data("local_shadow_alert", signature)
+                self.post_message(
+                    mtype=None,
+                    title=f"{self.plugin_name}：发现本地副本",
+                    text=(
+                        "本地插件目录中有本插件的同名副本，MoviePilot 会优先加载它，"
+                        "插件市场的更新可能不会生效：\n" + "\n".join(found)
+                        + "\n如非有意保留，请移走该目录后重新安装插件。"
+                    ),
+                )
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}：本地副本告警发送失败：{err}")
+        logger.warning(f"{self.plugin_name}：本地插件目录存在同名副本 {found}，可能覆盖插件市场版本")
+        return found
+
     def init_plugin(self, config: Optional[Dict[str, Any]] = None) -> None:
         """根据插件配置初始化运行开关与参数。"""
+        try:
+            self._check_local_shadow()
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}：本地副本检查失败：{err}")
         self.stop_service()
         if not config:
             return
@@ -512,6 +571,16 @@ class BitrateSelector(_PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         """注册库内基线播种与低码巡检自动洗版定时服务。"""
         services: List[Dict[str, Any]] = []
+        if self._enabled and self._wash_enabled:
+            services.append(
+                {
+                    "id": "BitrateSelectorGraduate",
+                    "name": "码率达标集停止洗版",
+                    "trigger": CronTrigger.from_crontab("45 7 * * *"),
+                    "func": self._safe_graduate,
+                    "kwargs": {},
+                }
+            )
         if self._enabled and self._wash_enabled:
             services.append(
                 {
@@ -1231,10 +1300,12 @@ class BitrateSelector(_PluginBase):
             episode_map = entry.setdefault("episodes", {})
             source_map = entry.setdefault("ep_sources", {})
             floor_map = entry.setdefault("ep_floors", {})
+            actual_map = entry.setdefault("ep_actual", {})
             for episode in episodes:
                 episode_map[str(episode)] = mbps
                 source_map[str(episode)] = source or "measured"
                 floor_map.pop(str(episode), None)
+                actual_map[str(episode)] = int(time.time())
             self.save_data(WASH_BASELINES_KEY, self._baselines)
         logger.info(
             f"码率优选：入库实测 {key} {self._compress_episode_ranges(episodes)} => {mbps}Mbps"
@@ -1515,6 +1586,7 @@ class BitrateSelector(_PluginBase):
                 entry["eps"].setdefault(episode_number, []).append(rate)
             else:
                 entry["unknown"].append((info_path.stem[:20], rate))
+        self._last_scan_stale = stale_skipped
         if stale_skipped:
             logger.info(
                 f"码率优选：低码巡检复核 strm 实际大小，跳过 {stale_skipped} 个已换版/无 strm 的过期边车条目"
@@ -1669,6 +1741,145 @@ class BitrateSelector(_PluginBase):
                 demotions.pop(sid, None)
         return rows
 
+    def _idle_reason(
+        self,
+        priority_map: Dict[str, int],
+        skipped: List[int],
+        baselines: Dict[str, Any],
+        records: Dict[str, Any],
+        now: float,
+    ) -> str:
+        """说明低码集本轮未降级待洗的原因。"""
+        reasons: List[str] = []
+        no_record = [e for e in skipped if priority_map.get(str(e)) is None]
+        no_base = [e for e in skipped if str(e) not in baselines and e not in no_record]
+        cooling = [
+            e for e in skipped
+            if float((records.get(str(e)) or {}).get("cooldown", 0) or 0) > now
+        ]
+        budget = [e for e in skipped if e not in no_record + no_base + cooling]
+        if cooling:
+            until = max(float(records[str(e)]["cooldown"]) for e in cooling)
+            reasons.append(
+                f"{self._compress_episode_ranges(cooling)} 近期洗过未找到更好版本，"
+                f"冷却至 {time.strftime('%m-%d', time.localtime(until))}"
+            )
+        if no_base:
+            reasons.append(f"{self._compress_episode_ranges(no_base)} 缺码率基线")
+        if no_record:
+            reasons.append(f"{self._compress_episode_ranges(no_record)} 订阅无下载记录")
+        if budget:
+            reasons.append(f"{self._compress_episode_ranges(budget)} 本轮额度已满，下轮处理")
+        return "；".join(reasons) or "无可洗集"
+
+    @staticmethod
+    def _plan_graduation(
+        priority_map: Dict[str, int],
+        baselines: Dict[str, Any],
+        watch: Dict[str, Any],
+        now: float,
+        margin: float,
+        excluded: Set[str],
+    ) -> Tuple[List[int], Dict[str, Any]]:
+        """
+        规划可以停止洗版的集。
+
+        条件：已下载但规则未满分（核心仍会每轮搜索），码率不低于 GRADUATE_MIN_MBPS，
+        且观察期 GRADUATE_WATCH_SECONDS 内码率未再提升超过领先比例。
+        观察期内洗到明显更好的版本会重新计时。
+
+        :return: (可停止洗版的集, 更新后的观察记录)
+        """
+        graduate: List[int] = []
+        new_watch: Dict[str, Any] = {}
+        for key, priority in priority_map.items():
+            try:
+                episode = int(key)
+            except (TypeError, ValueError):
+                continue
+            if priority <= 0 or priority >= FULL_EPISODE_PRIORITY or key in excluded:
+                continue
+            base = baselines.get(key)
+            if base is None or float(base) < GRADUATE_MIN_MBPS:
+                continue
+            record = watch.get(key)
+            if not record or float(base) > float(record.get("mbps", 0)) * (1 + margin):
+                new_watch[key] = {"ts": now, "mbps": float(base)}
+                continue
+            if now - float(record.get("ts", now)) >= GRADUATE_WATCH_SECONDS:
+                graduate.append(episode)
+                continue
+            new_watch[key] = record
+        return sorted(graduate), new_watch
+
+    def _safe_graduate(self) -> Dict[str, Any]:
+        """定时执行洗版毕业，吞掉异常。"""
+        try:
+            return self._graduate_episodes()
+        except Exception as err:
+            logger.error(f"码率优选：码率达标集停止洗版失败：{err}")
+            return {"success": False, "message": str(err)}
+
+    def _graduate_episodes(self) -> Dict[str, Any]:
+        """
+        对码率已达标、观察期内没有洗到更好版本的集停止洗版。
+
+        核心按规则优先级判定洗版完成，规则拿不到满分的集会被永久反复搜索；
+        这里把满足条件的集写为规则满分，核心即不再为其搜索。
+        """
+        if not (self._enabled and self._wash_enabled):
+            return {"success": False, "graduated": 0}
+        now = time.time()
+        margin = max(0, int(self._margin_percent)) / 100.0
+        watch_all: Dict[str, Any] = self.get_data(GRADUATION_KEY) or {}
+        demotions: Dict[str, Any] = self.get_data(INSPECT_DEMOTIONS_KEY) or {}
+        rows: List[str] = []
+        total = 0
+        new_watch_all: Dict[str, Any] = {}
+        for subscribe in SubscribeOper().list() or []:
+            if getattr(subscribe, "type", None) != MediaType.TV.value:
+                continue
+            if not getattr(subscribe, "best_version", False):
+                continue
+            if subscription_priority.is_full_best_version_enabled(subscribe):
+                continue
+            sid = str(getattr(subscribe, "id", ""))
+            priority_map = dict(subscription_priority.get_episode_priority(subscribe))
+            baselines = self._wash_baseline_entry(subscribe).get("episodes") or {}
+            excluded = {k for k, rec in (demotions.get(sid) or {}).items() if rec.get("ts")}
+            graduate, new_watch = self._plan_graduation(
+                priority_map, baselines, watch_all.get(sid) or {}, now, margin, excluded
+            )
+            if new_watch:
+                new_watch_all[sid] = new_watch
+            if not graduate:
+                continue
+            for episode in graduate:
+                priority_map[str(episode)] = FULL_EPISODE_PRIORITY
+            try:
+                self._write_episode_priority(sid, priority_map)
+            except Exception as err:
+                logger.error(f"码率优选：订阅 {sid} 停止洗版写入失败：{err}")
+                continue
+            total += len(graduate)
+            label = f"{getattr(subscribe, 'name', sid)} {self._compress_episode_ranges(graduate)}"
+            rows.append(f"· {label}")
+            logger.info(
+                f"码率优选：{label} 码率已达 {GRADUATE_MIN_MBPS:g}Mbps 以上且 3 天内未找到更好版本，停止洗版"
+            )
+        self.save_data(GRADUATION_KEY, new_watch_all)
+        if rows and self._notify:
+            self.post_message(
+                mtype=None,
+                title="码率优选：停止洗版",
+                text=(
+                    f"以下集码率已达 {GRADUATE_MIN_MBPS:g} Mbps 以上，3 天内没找到更好的版本，"
+                    "不再反复搜索：\n" + "\n".join(rows[:8])
+                    + ("\n（若某部剧全部集都已停止洗版，MoviePilot 会把该洗版订阅视为完成）")
+                ),
+            )
+        return {"success": True, "graduated": total}
+
     def _low_bitrate_inspect(self) -> Dict[str, Any]:
         """
         巡检媒体库低码集，让在订洗版订阅重新搜索这些集。
@@ -1747,7 +1958,7 @@ class BitrateSelector(_PluginBase):
             if not records:
                 demotions.pop(sid, None)
             if not demote and not pending:
-                reason = "已在冷却期或缺基线" if skipped else "无可洗集"
+                reason = self._idle_reason(priority_map, skipped, baselines, records, now)
                 idle_rows.append(f"· {summary}（{reason}）")
                 continue
             if not demote and now - float(triggers.get(sid, 0)) < INSPECT_THROTTLE_SECONDS:
@@ -1784,6 +1995,13 @@ class BitrateSelector(_PluginBase):
             if failed_rows:
                 lines.append("以下处理失败，请留意：")
                 lines.extend(failed_rows[:4])
+            if idle_rows:
+                lines.append("以下低码集本轮未处理：")
+                lines.extend(idle_rows[:6])
+            if self._last_scan_stale:
+                lines.append(
+                    f"另有 {self._last_scan_stale} 个条目的边车显示低码，但实际文件已是高码（边车未刷新），已忽略"
+                )
             if not_wash_rows:
                 lines.append("以下订阅未开启分集洗版，不自动处理：")
                 lines.extend(not_wash_rows[:6])
@@ -1881,6 +2099,7 @@ class BitrateSelector(_PluginBase):
         episode_map = entry.setdefault("episodes", {})
         floor_map = entry.setdefault("ep_floors", {})
         source_map = entry.setdefault("ep_sources", {})
+        actual_map = entry.get("ep_actual") or {}
         seeded = 0
         corrected = 0
         verified_fixed = 0
@@ -1917,6 +2136,11 @@ class BitrateSelector(_PluginBase):
                 seeded += 1
             elif self._baseline_diverged(existing, bitrate) or (
                 verified and abs(float(existing) - bitrate) > float(existing) * SEED_VERIFY_TOLERANCE
+            ) or (
+                # 统一口径迁移：库内实测与基线差超 5% 时以库内为准；
+                # 已按入库文件实测记录的集不被可能过期的边车覆盖
+                ep_key not in actual_map
+                and abs(float(existing) - bitrate) > float(existing) * SEED_RECALIBRATE_TOLERANCE
             ):
                 if verified and not self._baseline_diverged(existing, bitrate):
                     verified_fixed += 1
@@ -1997,21 +2221,26 @@ class BitrateSelector(_PluginBase):
             return None
 
     def _mediainfo_bitrate_mbps(self, path: Path) -> Optional[float]:
-        """读取 P115StrmHelper mediainfo 中视频流的实测码率（Mbps）。"""
+        """
+        读取 P115StrmHelper mediainfo 的整体码率（Mbps，含音轨）。
+
+        与候选估算、入库实测同口径（文件体积 ÷ 时长）：优先 Size/RunTimeTicks，
+        其次容器总码率 Bitrate，最后才退回视频流码率。
+        """
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             source = data[0]["MediaSourceInfo"]
-            video = next(
-                stream
-                for stream in source.get("MediaStreams", [])
-                if stream.get("Type") == "Video"
-            )
-            bitrate = int(video.get("BitRate") or 0)
+            size = int(source.get("Size") or 0)
+            ticks = float(source.get("RunTimeTicks") or 0)
+            bitrate = int(size * 8 / (ticks / 10_000_000)) if size and ticks else 0
             if not bitrate:
-                size = int(source.get("Size") or 0)
-                ticks = float(source.get("RunTimeTicks") or 0)
-                if size and ticks:
-                    bitrate = int(size * 8 / (ticks / 10_000_000))
+                bitrate = int(source.get("Bitrate") or 0)
+            if not bitrate:
+                video = next(
+                    (s for s in source.get("MediaStreams", []) if s.get("Type") == "Video"),
+                    {},
+                )
+                bitrate = int(video.get("BitRate") or 0)
             return round(bitrate / 1_000_000, 2) if bitrate else None
         except (OSError, ValueError, KeyError, IndexError, TypeError):
             return None

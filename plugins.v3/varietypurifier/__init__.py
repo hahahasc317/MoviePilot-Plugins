@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.plugins import _PluginBase
@@ -33,7 +34,7 @@ class VarietyPurifier(_PluginBase):
         "被拦文件保留在下载目录不影响做种。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "varietypurifier_"
     plugin_order = 16
@@ -54,8 +55,56 @@ class VarietyPurifier(_PluginBase):
     _notify_lock = threading.Lock()
     _history_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
 
+    def _check_local_shadow(self) -> List[str]:
+        """
+        检查本地插件目录中是否存在本插件的同名副本。
+
+        MoviePilot 会优先加载本地副本，插件市场的更新因此不生效（安装提示成功但仍运行旧版）。
+        发现副本时按路径去重通知一次，返回发现的路径列表。
+        """
+        roots: List[str] = []
+        try:
+            from app.core.config import settings  # pylint: disable=import-outside-toplevel
+
+            raw = getattr(settings, "PLUGIN_LOCAL_REPO_PATHS", "") or ""
+            roots = [part.strip() for part in str(raw).replace(";", ",").split(",") if part.strip()]
+        except Exception:
+            roots = []
+        if not roots:
+            roots = ["/config/local-plugins"]
+        plugin_dir = self.__class__.__name__.lower()
+        found: List[str] = []
+        for root in roots:
+            for sub in ("", "plugins.v3", "plugins.v2", "plugins"):
+                candidate = os.path.join(root, sub, plugin_dir) if sub else os.path.join(root, plugin_dir)
+                if os.path.isdir(candidate):
+                    found.append(candidate)
+        if not found:
+            return []
+        signature = "|".join(sorted(found))
+        try:
+            if self.get_data("local_shadow_alert") != signature:
+                self.save_data("local_shadow_alert", signature)
+                self.post_message(
+                    mtype=None,
+                    title=f"{self.plugin_name}：发现本地副本",
+                    text=(
+                        "本地插件目录中有本插件的同名副本，MoviePilot 会优先加载它，"
+                        "插件市场的更新可能不会生效：\n" + "\n".join(found)
+                        + "\n如非有意保留，请移走该目录后重新安装插件。"
+                    ),
+                )
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}：本地副本告警发送失败：{err}")
+        logger.warning(f"{self.plugin_name}：本地插件目录存在同名副本 {found}，可能覆盖插件市场版本")
+        return found
+
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态，并回填近期下载来源。"""
+        try:
+            self._check_local_shadow()
+        except Exception as err:
+            logger.warning(f"{self.plugin_name}：本地副本检查失败：{err}")
         self._notify_buffer = []
         self._history_cache = {}
         if self._notify_timer is not None:
