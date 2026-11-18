@@ -62,8 +62,16 @@ SEED_VERIFY_TOLERANCE = 0.15
 # 单次播种最多核实的集数与核实间隔，防止 115 直链请求过密
 SEED_VERIFY_MAX_PER_RUN = 300
 SEED_VERIFY_INTERVAL_SECONDS = 0.3
+# 网络源（WEB-DL 等）合理码率上限，超出视为集数识别错误；原盘/REMUX 不受限
+IMPLAUSIBLE_WEB_MBPS = 50.0
+DISC_SOURCE_RE = re.compile(r"remux|blu-?ray|bdmv|uhd\s*bd|原盘", re.IGNORECASE)
+# 标题声明的集数范围：E01-E30 / EP01~EP30 / 第1-30集；全30集 / 共30集
+TITLE_EP_RANGE_RE = re.compile(
+    r"(?:\bE[Pp]?|第)\s*(\d{1,4})\s*(?:-|~|～|—|至)\s*(?:E[Pp]?)?\s*(\d{1,4})", re.IGNORECASE
+)
+TITLE_EP_TOTAL_RE = re.compile(r"[全共]\s*(\d{1,4})\s*集")
 # 旧版虚高下限一次性清理标记
-FLOOR_MIGRATION_KEY = "floor_migration_146"
+FLOOR_MIGRATION_KEY = "floor_migration_147"
 # 选种淘汰通知去重记录的存储键与去重时长
 SELECTION_NOTICE_KEY = "selection_notices"
 SELECTION_NOTICE_TTL_SECONDS = 24 * 3600
@@ -89,7 +97,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.4.6"
+    plugin_version = "1.4.7"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -445,7 +453,7 @@ class BitrateSelector(_PluginBase):
 
     def _migrate_inflated_floors(self) -> None:
         """
-        一次性清除 1.4.6 之前记录的防降级下限。
+        一次性清除 1.4.7 之前记录的防降级下限。
 
         旧版整季包只为部分集下载时把整包体积摊到所选集上，下限可能虚高数倍，
         会在 48 小时内拦下所有正常候选；清除后由库内播种按实际文件重建基线。
@@ -936,6 +944,8 @@ class BitrateSelector(_PluginBase):
         margin = max(0, int(self._margin_percent)) / 100.0
         if subscription_priority.is_full_best_version_enabled(subscribe):
             candidate_mbps, candidate_source = self._estimate_bitrate_ex(context, set())
+            if candidate_source == "implausible":
+                return False
             if candidate_mbps is None:
                 return original(subscribe, context, priority)
             baseline_entry = self._wash_baseline_entry(subscribe)
@@ -1000,6 +1010,9 @@ class BitrateSelector(_PluginBase):
         candidate_mbps, candidate_source = self._estimate_bitrate_ex(
             context, set(selected_episodes) if selected_episodes else set()
         )
+        if candidate_source == "implausible":
+            # 码率估算不可信（集数识别错误）时不能回退规则判定：规则会照常放行
+            return []
         if candidate_mbps is None:
             return None
         episode_baselines = self._wash_baseline_entry(subscribe).get("episodes") or {}
@@ -2065,13 +2078,46 @@ class BitrateSelector(_PluginBase):
             return None, ""
         meta = ctx.meta_info
         season = (meta.begin_season or 1) if meta else 1
+        # 种子体积对应的是种子自身全部内容：识别出的集数少于标题声明的范围时
+        # （如整季包只解析出 E01），按标题范围计算时长，避免整包体积摊到一集上
+        title_range = self._title_episode_range(torrent)
+        if title_range and episodes and len(title_range) > len(episodes):
+            episodes = title_range
         minutes_map, source = self._resolve_episode_minutes(media, season, episodes)
         if not minutes_map:
             return None, ""
         total_minutes = sum(minutes_map.values())
         if total_minutes <= 0:
             return None, ""
-        return torrent.size * 8 / (total_minutes * 60) / 1_000_000, source
+        mbps = torrent.size * 8 / (total_minutes * 60) / 1_000_000
+        if mbps > IMPLAUSIBLE_WEB_MBPS and not self._is_disc_source(torrent):
+            logger.warning(
+                f"码率优选：估算 {mbps:.1f}Mbps 超出网络源合理范围，疑似集数识别错误，"
+                f"不采信（{(getattr(torrent, 'title', '') or '')[:60]}）"
+            )
+            return None, "implausible"
+        return mbps, source
+
+    @staticmethod
+    def _title_episode_range(torrent: Any) -> Set[int]:
+        """从种子标题/副标题解析声明的集数范围（E01-E30、全30集、共30集），无则空集。"""
+        text = f"{getattr(torrent, 'title', '') or ''} {getattr(torrent, 'description', '') or ''}"
+        best: Set[int] = set()
+        for match in TITLE_EP_RANGE_RE.finditer(text):
+            start, end = int(match.group(1)), int(match.group(2))
+            if 0 < start <= end <= 2000 and end - start + 1 > len(best):
+                best = set(range(start, end + 1))
+        for match in TITLE_EP_TOTAL_RE.finditer(text):
+            total = int(match.group(1))
+            if 0 < total <= 2000 and total > len(best):
+                best = set(range(1, total + 1))
+        return best
+
+    @staticmethod
+    def _is_disc_source(torrent: Any) -> bool:
+        """是否原盘/重编码蓝光等高码率来源（不适用网络源码率上限）。"""
+        title = f"{getattr(torrent, 'title', '') or ''} {getattr(torrent, 'description', '') or ''}"
+        return bool(DISC_SOURCE_RE.search(title))
 
     def _resolve_episode_minutes(
         self, media: Any, season: int, episodes: Set[int]

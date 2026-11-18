@@ -360,6 +360,63 @@ class RecordBaselineTest(unittest.TestCase):
         self.assertIn("7", plugin._baselines["k"]["ep_floors"])
 
 
+class MisparsedPackTest(unittest.TestCase):
+    """复现谷雨：20GB 整季包被识别为仅 E01，估出 62.6Mbps 后以「洗版升级」下载。"""
+
+    TITLE = "[TV Series/HD]The Silent Storm S01 2026 2160p YK WEB-DL H265 AAC-ADWeb"
+    DESC = "谷雨/The Silent Storm | 4K | 集数：E01-E30（共30集）"
+
+    def _ctx(self, title=None, desc=None, size_gb=20.12, eps=(1,)):
+        return NS(
+            torrent_info=NS(size=int(size_gb * 1024 ** 3), title=title or self.TITLE,
+                            description=self.DESC if desc is None else desc, pri_order=100),
+            meta_info=NS(begin_season=1, begin_episode=1, end_episode=None, total_episode=None,
+                         episode_list=list(eps)),
+            media_info=NS(tmdb_id=279155, title="谷雨", year="2026",
+                          media_source="themoviedb", media_id="279155"),
+            selected_episodes=None, allowed_episodes=None,
+        )
+
+    def test_title_range_parsing(self):
+        rng = bs.BitrateSelector._title_episode_range
+        self.assertEqual(rng(NS(title="x", description="集数：E01-E30（共30集）")), set(range(1, 31)))
+        self.assertEqual(rng(NS(title="Show 全24集", description="")), set(range(1, 25)))
+        self.assertEqual(rng(NS(title="Show 第1-12集", description="")), set(range(1, 13)))
+        self.assertEqual(rng(NS(title="Show S01E05 2160p WEB-DL H265-ADWeb", description="")), set())
+
+    def test_estimate_uses_title_range(self):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 31)}
+        mbps, _ = plugin._estimate_bitrate_ex(self._ctx(), {1})
+        self.assertAlmostEqual(mbps, 20.12 * 1024 ** 3 * 8 / (30 * 45 * 60) / 1e6, places=2)
+
+    def test_wash_rejects_misparsed_pack(self):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 31)}
+        plugin._baselines = {"themoviedb:279155:1": {"episodes": {str(e): 16.0 for e in range(1, 31)}}}
+        subscribe = make_subscribe(id=122, name="谷雨", total_episode=30, media_id="279155",
+                                   episode_priority={str(e): 96 for e in range(1, 31)})
+        self.assertFalse(plugin._wash_admit(subscribe, self._ctx(), 100, lambda *a: True))
+
+    def test_implausible_estimate_rejected_not_fallback(self):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 31)}
+        plugin._baselines = {"themoviedb:279155:1": {"episodes": {str(e): 16.0 for e in range(1, 31)}}}
+        subscribe = make_subscribe(id=122, name="谷雨", total_episode=30, media_id="279155",
+                                   episode_priority={str(e): 96 for e in range(1, 31)})
+        ctx = self._ctx(desc="")  # 无任何范围线索
+        mbps, source = plugin._estimate_bitrate_ex(ctx, {1})
+        self.assertEqual((mbps, source), (None, "implausible"))
+        self.assertFalse(plugin._wash_admit(subscribe, ctx, 100, lambda *a: True))
+
+    def test_remux_not_capped(self):
+        plugin = make_plugin()
+        ctx = self._ctx(title="Blue.Planet.II.S01E01.2160p.BluRay.REMUX.HEVC", desc="", size_gb=40)
+        mbps, source = plugin._estimate_bitrate_ex(ctx, {1})
+        self.assertGreater(mbps, 50)
+        self.assertNotEqual(source, "implausible")
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -526,6 +583,63 @@ class RecordBaselineTest(unittest.TestCase):
         plugin._baselines["k"]["ep_floors"] = {"7": [12.0, time.time()]}
         plugin._migrate_inflated_floors()   # 第二次不再清除新记录的下限
         self.assertIn("7", plugin._baselines["k"]["ep_floors"])
+
+
+class MisparsedPackTest(unittest.TestCase):
+    """复现谷雨：20GB 整季包被识别为仅 E01，估出 62.6Mbps 后以「洗版升级」下载。"""
+
+    TITLE = "[TV Series/HD]The Silent Storm S01 2026 2160p YK WEB-DL H265 AAC-ADWeb"
+    DESC = "谷雨/The Silent Storm | 4K | 集数：E01-E30（共30集）"
+
+    def _ctx(self, title=None, desc=None, size_gb=20.12, eps=(1,)):
+        return NS(
+            torrent_info=NS(size=int(size_gb * 1024 ** 3), title=title or self.TITLE,
+                            description=self.DESC if desc is None else desc, pri_order=100),
+            meta_info=NS(begin_season=1, begin_episode=1, end_episode=None, total_episode=None,
+                         episode_list=list(eps)),
+            media_info=NS(tmdb_id=279155, title="谷雨", year="2026",
+                          media_source="themoviedb", media_id="279155"),
+            selected_episodes=None, allowed_episodes=None,
+        )
+
+    def test_title_range_parsing(self):
+        rng = bs.BitrateSelector._title_episode_range
+        self.assertEqual(rng(NS(title="x", description="集数：E01-E30（共30集）")), set(range(1, 31)))
+        self.assertEqual(rng(NS(title="Show 全24集", description="")), set(range(1, 25)))
+        self.assertEqual(rng(NS(title="Show 第1-12集", description="")), set(range(1, 13)))
+        self.assertEqual(rng(NS(title="Show S01E05 2160p WEB-DL H265-ADWeb", description="")), set())
+
+    def test_estimate_uses_title_range(self):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 31)}
+        mbps, _ = plugin._estimate_bitrate_ex(self._ctx(), {1})
+        self.assertAlmostEqual(mbps, 20.12 * 1024 ** 3 * 8 / (30 * 45 * 60) / 1e6, places=2)
+
+    def test_wash_rejects_misparsed_pack(self):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 31)}
+        plugin._baselines = {"themoviedb:279155:1": {"episodes": {str(e): 16.0 for e in range(1, 31)}}}
+        subscribe = make_subscribe(id=122, name="谷雨", total_episode=30, media_id="279155",
+                                   episode_priority={str(e): 96 for e in range(1, 31)})
+        self.assertFalse(plugin._wash_admit(subscribe, self._ctx(), 100, lambda *a: True))
+
+    def test_implausible_estimate_rejected_not_fallback(self):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 31)}
+        plugin._baselines = {"themoviedb:279155:1": {"episodes": {str(e): 16.0 for e in range(1, 31)}}}
+        subscribe = make_subscribe(id=122, name="谷雨", total_episode=30, media_id="279155",
+                                   episode_priority={str(e): 96 for e in range(1, 31)})
+        ctx = self._ctx(desc="")  # 无任何范围线索
+        mbps, source = plugin._estimate_bitrate_ex(ctx, {1})
+        self.assertEqual((mbps, source), (None, "implausible"))
+        self.assertFalse(plugin._wash_admit(subscribe, ctx, 100, lambda *a: True))
+
+    def test_remux_not_capped(self):
+        plugin = make_plugin()
+        ctx = self._ctx(title="Blue.Planet.II.S01E01.2160p.BluRay.REMUX.HEVC", desc="", size_gb=40)
+        mbps, source = plugin._estimate_bitrate_ex(ctx, {1})
+        self.assertGreater(mbps, 50)
+        self.assertNotEqual(source, "implausible")
 
 
 if __name__ == "__main__":
