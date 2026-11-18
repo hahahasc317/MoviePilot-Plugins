@@ -301,7 +301,8 @@ class WashMixin:
 
         下载前的估算会受整季包部分下载、集数识别错误、边车未刷新等影响；
         入库后的文件大小是真实值，以此为准并清除对应集的防降级下限。
-        仅处理单文件整理（文件数为 1）的剧集，多文件整理无法拆分到集时跳过。
+        单文件整理按该文件大小计算；多集合集一次整理多个文件时，视频文件数与
+        识别出的集数一致才按合集总大小 ÷ 总时长计算平均码率记给每一集，对不上则跳过。
 
         :return: (基线键, 集号列表, 码率)；未记录时返回 None
         """
@@ -313,19 +314,29 @@ class WashMixin:
         media_type = getattr(media, "type", None)
         if media_type not in (MediaType.TV, MediaType.TV.value, "电视剧"):
             return None
-        if int(getattr(info, "file_count", 0) or 0) > 1:
-            return None
-        target = getattr(info, "target_item", None)
-        size = int(getattr(target, "size", 0) or 0) or int(getattr(info, "total_size", 0) or 0)
-        name = str(getattr(target, "name", "") or "")
-        if size < TRANSFER_MIN_VIDEO_BYTES or (name and not name.lower().endswith(VIDEO_EXTS)):
-            return None
         episodes = sorted({int(e) for e in (getattr(meta, "episode_list", None) or []) if e})
         if not episodes:
             begin = getattr(meta, "begin_episode", None)
             episodes = [int(begin)] if begin else []
         if not episodes:
             return None
+        file_count = int(getattr(info, "file_count", 0) or 0)
+        if file_count > 1:
+            listed = list(getattr(info, "file_list_new", None) or getattr(info, "file_list", None) or [])
+            videos = [str(f) for f in listed if str(f).lower().endswith(VIDEO_EXTS)]
+            video_count = len(videos) if listed else file_count
+            if video_count <= 1 or video_count != len(episodes):
+                return None
+            size = int(getattr(info, "total_size", 0) or 0)
+            name = videos[0].rsplit("/", 1)[-1] if videos else ""
+            if size < TRANSFER_MIN_VIDEO_BYTES * video_count:
+                return None
+        else:
+            target = getattr(info, "target_item", None)
+            size = int(getattr(target, "size", 0) or 0) or int(getattr(info, "total_size", 0) or 0)
+            name = str(getattr(target, "name", "") or "")
+            if size < TRANSFER_MIN_VIDEO_BYTES or (name and not name.lower().endswith(VIDEO_EXTS)):
+                return None
         season = int(getattr(meta, "begin_season", None) or 1)
         key = self._transfer_media_key(media, season)
         if not key:
