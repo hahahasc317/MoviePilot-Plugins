@@ -73,7 +73,7 @@ _stub("app.sdk.logging", logger=NS(**{n: (lambda *a, **k: None) for n in ("info"
 _stub("app.sdk.media", Context=NS)
 _stub("app.schemas.event", ResourceDownloadEventData=object, ResourceSelectionEventData=object)
 _stub("app.schemas.media", resolve_media_identity=lambda media: (media.media_source, media.media_id))
-_stub("app.schemas.types", ChainEventType=NS(ResourceSelection=1, ResourceDownload=2), EventType=NS(PluginAction=5), MediaType=MediaType)
+_stub("app.schemas.types", ChainEventType=NS(ResourceSelection=1, ResourceDownload=2), EventType=NS(PluginAction=5, TransferComplete=6), MediaType=MediaType)
 
 _PATH = Path(__file__).resolve().parents[1] / "plugins.v3" / "bitrateselector" / "__init__.py"
 _spec = importlib.util.spec_from_file_location("bitrateselector", _PATH)
@@ -417,6 +417,59 @@ class MisparsedPackTest(unittest.TestCase):
         self.assertNotEqual(source, "implausible")
 
 
+class TransferBaselineTest(unittest.TestCase):
+    """入库后按实际文件大小记录基线：复现谷雨 E01 被 801MB 低码版覆盖后的修正。"""
+
+    def _event(self, size, name="谷雨 - S01E01 - 第 1 集.mkv", eps=(1,), file_count=1, success=True):
+        return NS(
+            transferinfo=NS(success=success, file_count=file_count, total_size=size,
+                            target_item=NS(size=size, name=name)),
+            meta=NS(begin_season=1, begin_episode=eps[0] if eps else None, episode_list=list(eps)),
+            mediainfo=NS(type=MediaType.TV, tmdb_id=279155, media_source="themoviedb", media_id="279155"),
+        )
+
+    def _plugin(self):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 31)}
+        plugin._baselines = {"themoviedb:279155:1": {
+            "episodes": {"1": 17.47, "2": 15.72},
+            "ep_floors": {"1": [62.61, time.time()]},
+        }}
+        return plugin
+
+    def test_actual_file_overrides_stale_baseline_and_floor(self):
+        plugin = self._plugin()
+        size = int(801.62 * 1024 ** 2)
+        key, eps, mbps = plugin._record_transferred_baseline(self._event(size))
+        self.assertEqual((key, eps), ("themoviedb:279155:1", [1]))
+        self.assertAlmostEqual(mbps, size * 8 / (45 * 60) / 1e6, places=2)
+        entry = plugin._baselines[key]
+        self.assertEqual(entry["episodes"]["1"], mbps)
+        self.assertEqual(entry["episodes"]["2"], 15.72)
+        self.assertNotIn("1", entry["ep_floors"])
+        self.assertIs(plugin.get_data(bs.WASH_BASELINES_KEY), plugin._baselines)
+
+    def test_skips_unusable_events(self):
+        plugin = self._plugin()
+        big = 6 * 1024 ** 3
+        self.assertIsNone(plugin._record_transferred_baseline(self._event(big, file_count=4)))
+        self.assertIsNone(plugin._record_transferred_baseline(self._event(2048, name="x.strm")))
+        self.assertIsNone(plugin._record_transferred_baseline(self._event(big, success=False)))
+        self.assertIsNone(plugin._record_transferred_baseline(self._event(big, eps=())))
+        self.assertIsNone(plugin._record_transferred_baseline(None))
+        self.assertEqual(plugin._baselines["themoviedb:279155:1"]["episodes"]["1"], 17.47)
+
+    def test_handler_respects_switches(self):
+        plugin = self._plugin()
+        plugin._wash_enabled = False
+        plugin.on_transfer_complete(NS(event_data=self._event(6 * 1024 ** 3)))
+        self.assertEqual(plugin._baselines["themoviedb:279155:1"]["episodes"]["1"], 17.47)
+        plugin._wash_enabled = True
+        plugin.on_transfer_complete(NS(event_data=self._event(6 * 1024 ** 3)))
+        self.assertAlmostEqual(plugin._baselines["themoviedb:279155:1"]["episodes"]["1"],
+                               round(6 * 1024 ** 3 * 8 / 2700 / 1e6, 2))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -640,6 +693,59 @@ class MisparsedPackTest(unittest.TestCase):
         mbps, source = plugin._estimate_bitrate_ex(ctx, {1})
         self.assertGreater(mbps, 50)
         self.assertNotEqual(source, "implausible")
+
+
+class TransferBaselineTest(unittest.TestCase):
+    """入库后按实际文件大小记录基线：复现谷雨 E01 被 801MB 低码版覆盖后的修正。"""
+
+    def _event(self, size, name="谷雨 - S01E01 - 第 1 集.mkv", eps=(1,), file_count=1, success=True):
+        return NS(
+            transferinfo=NS(success=success, file_count=file_count, total_size=size,
+                            target_item=NS(size=size, name=name)),
+            meta=NS(begin_season=1, begin_episode=eps[0] if eps else None, episode_list=list(eps)),
+            mediainfo=NS(type=MediaType.TV, tmdb_id=279155, media_source="themoviedb", media_id="279155"),
+        )
+
+    def _plugin(self):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 31)}
+        plugin._baselines = {"themoviedb:279155:1": {
+            "episodes": {"1": 17.47, "2": 15.72},
+            "ep_floors": {"1": [62.61, time.time()]},
+        }}
+        return plugin
+
+    def test_actual_file_overrides_stale_baseline_and_floor(self):
+        plugin = self._plugin()
+        size = int(801.62 * 1024 ** 2)
+        key, eps, mbps = plugin._record_transferred_baseline(self._event(size))
+        self.assertEqual((key, eps), ("themoviedb:279155:1", [1]))
+        self.assertAlmostEqual(mbps, size * 8 / (45 * 60) / 1e6, places=2)
+        entry = plugin._baselines[key]
+        self.assertEqual(entry["episodes"]["1"], mbps)
+        self.assertEqual(entry["episodes"]["2"], 15.72)
+        self.assertNotIn("1", entry["ep_floors"])
+        self.assertIs(plugin.get_data(bs.WASH_BASELINES_KEY), plugin._baselines)
+
+    def test_skips_unusable_events(self):
+        plugin = self._plugin()
+        big = 6 * 1024 ** 3
+        self.assertIsNone(plugin._record_transferred_baseline(self._event(big, file_count=4)))
+        self.assertIsNone(plugin._record_transferred_baseline(self._event(2048, name="x.strm")))
+        self.assertIsNone(plugin._record_transferred_baseline(self._event(big, success=False)))
+        self.assertIsNone(plugin._record_transferred_baseline(self._event(big, eps=())))
+        self.assertIsNone(plugin._record_transferred_baseline(None))
+        self.assertEqual(plugin._baselines["themoviedb:279155:1"]["episodes"]["1"], 17.47)
+
+    def test_handler_respects_switches(self):
+        plugin = self._plugin()
+        plugin._wash_enabled = False
+        plugin.on_transfer_complete(NS(event_data=self._event(6 * 1024 ** 3)))
+        self.assertEqual(plugin._baselines["themoviedb:279155:1"]["episodes"]["1"], 17.47)
+        plugin._wash_enabled = True
+        plugin.on_transfer_complete(NS(event_data=self._event(6 * 1024 ** 3)))
+        self.assertAlmostEqual(plugin._baselines["themoviedb:279155:1"]["episodes"]["1"],
+                               round(6 * 1024 ** 3 * 8 / 2700 / 1e6, 2))
 
 
 if __name__ == "__main__":

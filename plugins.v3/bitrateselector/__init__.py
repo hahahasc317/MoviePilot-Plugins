@@ -70,6 +70,9 @@ TITLE_EP_RANGE_RE = re.compile(
     r"(?:\bE[Pp]?|第)\s*(\d{1,4})\s*(?:-|~|～|—|至)\s*(?:E[Pp]?)?\s*(\d{1,4})", re.IGNORECASE
 )
 TITLE_EP_TOTAL_RE = re.compile(r"[全共]\s*(\d{1,4})\s*集")
+# 入库实测：视频文件最小体积与扩展名
+TRANSFER_MIN_VIDEO_BYTES = 50 * 1024 * 1024
+VIDEO_EXTS = (".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".wmv", ".flv", ".iso", ".rmvb", ".webm")
 # 旧版虚高下限一次性清理标记
 FLOOR_MIGRATION_KEY = "floor_migration_147"
 # 选种淘汰通知去重记录的存储键与去重时长
@@ -97,7 +100,7 @@ class BitrateSelector(_PluginBase):
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.4.7"
+    plugin_version = "1.5.0"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -1169,6 +1172,85 @@ class BitrateSelector(_PluginBase):
         except (TypeError, ValueError):
             season_number = 1
         return f"{source}:{media_id}:{season_number}"
+
+    @eventmanager.register(EventType.TransferComplete)
+    def on_transfer_complete(self, event: Event = None) -> None:
+        """整理入库后按实际文件大小记录该集码率基线（覆盖下载前的估算值）。"""
+        if not (self._enabled and self._wash_enabled):
+            return
+        try:
+            self._record_transferred_baseline(getattr(event, "event_data", None))
+        except Exception as err:
+            logger.warning(f"码率优选：入库实测记录基线失败：{err}")
+
+    def _record_transferred_baseline(self, data: Any) -> Optional[Tuple[str, List[int], float]]:
+        """
+        用整理完成事件中的实际文件大小 ÷ 该集时长计算码率并写入基线。
+
+        下载前的估算会受整季包部分下载、集数识别错误、边车未刷新等影响；
+        入库后的文件大小是真实值，以此为准并清除对应集的防降级下限。
+        仅处理单文件整理（文件数为 1）的剧集，多文件整理无法拆分到集时跳过。
+
+        :return: (基线键, 集号列表, 码率)；未记录时返回 None
+        """
+        info = getattr(data, "transferinfo", None)
+        meta = getattr(data, "meta", None)
+        media = getattr(data, "mediainfo", None)
+        if info is None or not getattr(info, "success", False) or meta is None or media is None:
+            return None
+        media_type = getattr(media, "type", None)
+        if media_type not in (MediaType.TV, MediaType.TV.value, "电视剧"):
+            return None
+        if int(getattr(info, "file_count", 0) or 0) > 1:
+            return None
+        target = getattr(info, "target_item", None)
+        size = int(getattr(target, "size", 0) or 0) or int(getattr(info, "total_size", 0) or 0)
+        name = str(getattr(target, "name", "") or "")
+        if size < TRANSFER_MIN_VIDEO_BYTES or (name and not name.lower().endswith(VIDEO_EXTS)):
+            return None
+        episodes = sorted({int(e) for e in (getattr(meta, "episode_list", None) or []) if e})
+        if not episodes:
+            begin = getattr(meta, "begin_episode", None)
+            episodes = [int(begin)] if begin else []
+        if not episodes:
+            return None
+        season = int(getattr(meta, "begin_season", None) or 1)
+        key = self._transfer_media_key(media, season)
+        if not key:
+            return None
+        minutes_map, source = self._resolve_episode_minutes(media, season, set(episodes))
+        total_minutes = sum((minutes_map or {}).values())
+        if total_minutes <= 0:
+            return None
+        mbps = round(size * 8 / (total_minutes * 60) / 1_000_000, 2)
+        if mbps > IMPLAUSIBLE_WEB_MBPS and not DISC_SOURCE_RE.search(name):
+            logger.warning(f"码率优选：入库文件码率 {mbps}Mbps 不合常理，未记录（{name}）")
+            return None
+        with self._baseline_lock:
+            entry = self._baselines.setdefault(key, {})
+            episode_map = entry.setdefault("episodes", {})
+            source_map = entry.setdefault("ep_sources", {})
+            floor_map = entry.setdefault("ep_floors", {})
+            for episode in episodes:
+                episode_map[str(episode)] = mbps
+                source_map[str(episode)] = source or "measured"
+                floor_map.pop(str(episode), None)
+            self.save_data(WASH_BASELINES_KEY, self._baselines)
+        logger.info(
+            f"码率优选：入库实测 {key} {self._compress_episode_ranges(episodes)} => {mbps}Mbps"
+            f"（{size / 1024 ** 3:.2f}GB，{name[:60]}）"
+        )
+        return key, episodes, mbps
+
+    def _transfer_media_key(self, media: Any, season: int) -> str:
+        """从整理事件的媒体快照构造基线键，与下载阶段的键保持一致。"""
+        try:
+            source, media_id = resolve_media_identity(media=media)
+        except Exception:
+            source, media_id = None, None
+        if not (source and media_id) and getattr(media, "tmdb_id", None):
+            source, media_id = "themoviedb", getattr(media, "tmdb_id")
+        return self._wash_media_key(source=source, media_id=media_id, season=season)
 
     def _record_wash_baseline(self, data: ResourceDownloadEventData) -> None:
         """
