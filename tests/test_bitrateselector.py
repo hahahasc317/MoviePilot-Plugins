@@ -75,10 +75,13 @@ _stub("app.schemas.event", ResourceDownloadEventData=object, ResourceSelectionEv
 _stub("app.schemas.media", resolve_media_identity=lambda media: (media.media_source, media.media_id))
 _stub("app.schemas.types", ChainEventType=NS(ResourceSelection=1, ResourceDownload=2), EventType=NS(PluginAction=5, TransferComplete=6), MediaType=MediaType)
 
-_PATH = Path(__file__).resolve().parents[1] / "plugins.v3" / "bitrateselector" / "__init__.py"
-_spec = importlib.util.spec_from_file_location("bitrateselector", _PATH)
+_ROOT = Path(__file__).resolve().parents[1] / "plugins.v3" / "bitrateselector"
+_spec = importlib.util.spec_from_file_location(
+    "bitrateselector", _ROOT / "__init__.py", submodule_search_locations=[str(_ROOT)])
 bs = importlib.util.module_from_spec(_spec)
+sys.modules["bitrateselector"] = bs
 _spec.loader.exec_module(bs)
+bs_library = sys.modules["bitrateselector.library"]
 
 
 def make_plugin(**overrides):
@@ -306,7 +309,7 @@ class SeedVerifyTest(unittest.TestCase):
 
         plugin._strm_remote_size = remote_size
         plugin._seed_verify_budget = 10
-        bs.SEED_VERIFY_INTERVAL_SECONDS = 0
+        bs_library.SEED_VERIFY_INTERVAL_SECONDS = 0
         return plugin
 
     def test_stale_sidecar_corrected_by_actual_file(self):
@@ -648,7 +651,7 @@ class SeedVerifyTest(unittest.TestCase):
 
         plugin._strm_remote_size = remote_size
         plugin._seed_verify_budget = 10
-        bs.SEED_VERIFY_INTERVAL_SECONDS = 0
+        bs_library.SEED_VERIFY_INTERVAL_SECONDS = 0
         return plugin
 
     def test_stale_sidecar_corrected_by_actual_file(self):
