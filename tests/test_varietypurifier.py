@@ -109,5 +109,48 @@ class SelectionTest(unittest.TestCase):
         self.assertFalse(data.updated)
 
 
+class _FakeHistoryOper:
+    """下载历史桩：文件路径 → hash，hash → note。"""
+
+    files = {}
+    notes = {}
+
+    def get_hash_by_fullpath(self, fullpath):
+        return self.files.get(fullpath, "")
+
+    def get_by_hash(self, download_hash):
+        note = self.notes.get(download_hash)
+        return NS(note=note) if note is not None else None
+
+
+class SourceByHashTest(unittest.TestCase):
+    def setUp(self):
+        for pkg in ("app.db", "app.db.oper"):
+            _stub(pkg)
+        _stub("app.db.oper.downloadhistory", DownloadHistoryOper=_FakeHistoryOper)
+        _FakeHistoryOper.files = {
+            "/downloads/Go.Now.S04.2160p-ADWeb/Go.Now.S04E05.mkv": "ABC123",
+            "/downloads/Some.Pack/Show.E01.mkv": "DEF456",
+        }
+        _FakeHistoryOper.notes = {"DEF456": {"source": "Manual"}}
+        self.plugin = make_plugin()
+        self.plugin._torrent_sources = {}
+        self.plugin._history_cache = {}
+        self.plugin.save_data = lambda *a: None
+
+    def test_download_event_hash_used_even_when_title_differs_from_dir(self):
+        event = NS(event_data=NS(source="Manual", hash="abc123",
+                                 context=NS(torrent_info=NS(title="[综艺]现在就出发 第四季 第5期 2160p"))))
+        self.plugin.on_download_added(event)
+        self.assertTrue(self.plugin._is_manual_torrent("/downloads/Go.Now.S04.2160p-ADWeb/Go.Now.S04E05.mkv"))
+
+    def test_history_note_when_no_event_record(self):
+        self.assertTrue(self.plugin._is_manual_torrent("/downloads/Some.Pack/Show.E01.mkv"))
+
+    def test_unknown_defaults_to_subscription(self):
+        self.plugin._lookup_source_from_history = lambda path: None
+        self.assertFalse(self.plugin._is_manual_torrent("/downloads/Unknown/x.mkv"))
+
+
 if __name__ == "__main__":
     unittest.main()

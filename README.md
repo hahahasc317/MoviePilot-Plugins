@@ -32,7 +32,7 @@ https://github.com/hahahasc317/MoviePilot-Plugins/raw/main/
 
 检测并修复 115 网盘上 CloudDrive2 / 115网盘Plus 留下的 mp-stage 暂存残留（SHA1 秒传重建），整理完成后定向复查 + 定时全量扫描；可选清理孤儿边车（单轮超 50 个自动刹车）；定时核验 durable 整理待复核任务。定时扫描只在有修复结果或异常时通知，115 限流自动熔断。
 
-### 综艺正片净化（VarietyPurifier）v1.2.1
+### 综艺正片净化（VarietyPurifier）v1.3.0
 
 订阅来源的综艺只要正片：选种阶段先剔除（早于码率优选），下载准入时整包拒收带加更/花絮/纯享等标记的种子，整理入库时逐文件拦截漏网的非正片与 Part 分半文件；手动下载放行。
 

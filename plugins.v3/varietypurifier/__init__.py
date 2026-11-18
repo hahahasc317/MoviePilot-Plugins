@@ -34,7 +34,7 @@ class VarietyPurifier(_PluginBase):
         "被拦文件保留在下载目录不影响做种。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "varietypurifier_"
     plugin_order = 16
@@ -321,16 +321,20 @@ class VarietyPurifier(_PluginBase):
             if isinstance(data, dict):
                 source = data.get("source")
                 context = data.get("context")
+                torrent_hash = data.get("hash")
             else:
                 source = getattr(data, "source", None)
                 context = getattr(data, "context", None)
+                torrent_hash = getattr(data, "hash", None)
+            record = {"manual": not is_subscribe_source(source), "ts": time.time()}
             title = self._extract_torrent_title(context)
-            if not title:
+            if not title and not torrent_hash:
                 return
-            self._torrent_sources[title] = {
-                "manual": not is_subscribe_source(source),
-                "ts": time.time(),
-            }
+            if torrent_hash:
+                # 按种子 hash 记录：整理时由文件路径反查 hash，不依赖标题与目录名一致
+                self._torrent_sources[f"hash:{str(torrent_hash).lower()}"] = record
+            if title:
+                self._torrent_sources[title] = dict(record)
             self._prune_sources()
             self.save_data(DATA_SOURCES_KEY, self._torrent_sources)
         except Exception as err:
@@ -477,7 +481,15 @@ class VarietyPurifier(_PluginBase):
         return str(mt)
 
     def _is_manual_torrent(self, path: str) -> bool:
-        """判别文件所属种子是否手动来源：优先事件映射，退化查下载历史。"""
+        """
+        判别文件所属种子是否手动来源。
+
+        优先由文件路径在下载文件记录中反查种子 hash，再按 hash 取下载事件记录的来源
+        或下载历史的 note.source；查不到 hash 时退回旧的「种子目录名 ↔ 标题」映射。
+        """
+        by_hash = self._source_by_hash(path)
+        if by_hash is not None:
+            return by_hash
         directory = self._torrent_dir(path)
         if directory:
             entry = self._torrent_sources.get(directory)
@@ -494,6 +506,46 @@ class VarietyPurifier(_PluginBase):
             return history_manual
         # 未知来源按订阅处理（过滤生效是安全方向）
         return False
+
+    def _source_by_hash(self, path: str) -> Optional[bool]:
+        """按文件路径反查种子 hash 判别来源；无法判别时返回 None。"""
+        cache_key = f"hash-path:{path}"
+        cached = self._history_cache.get(cache_key)
+        if cached is not None and time.time() - cached[0] < HISTORY_LOOKUP_TTL:
+            return cached[1]
+        result: Optional[bool] = None
+        try:
+            from app.db.oper.downloadhistory import (  # pylint: disable=import-outside-toplevel
+                DownloadHistoryOper,
+            )
+
+            oper = DownloadHistoryOper()
+            torrent_hash = oper.get_hash_by_fullpath(path)
+            if torrent_hash:
+                entry = self._torrent_sources.get(f"hash:{str(torrent_hash).lower()}")
+                if entry is not None:
+                    result = bool(entry.get("manual"))
+                else:
+                    history = oper.get_by_hash(torrent_hash)
+                    source = self._note_source(getattr(history, "note", None)) if history else None
+                    if source:
+                        result = not is_subscribe_source(str(source))
+        except Exception as err:
+            logger.debug(f"综艺正片净化：按 hash 判别来源失败，退回目录映射：{err}")
+            result = None
+        self._history_cache[cache_key] = (time.time(), result)
+        return result
+
+    @staticmethod
+    def _note_source(note: Any) -> Optional[str]:
+        """从下载历史 note（字典或 JSON 字符串）中取 source。"""
+        if isinstance(note, dict):
+            return note.get("source")
+        try:
+            payload = json.loads(str(note or "{}"))
+        except (TypeError, ValueError):
+            return None
+        return payload.get("source") if isinstance(payload, dict) else None
 
     def _lookup_source_from_history(self, path: str) -> Optional[bool]:
         """按路径查下载历史 note.source 判别来源；异常返回 None。"""
