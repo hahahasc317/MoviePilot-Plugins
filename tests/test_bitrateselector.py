@@ -1,6 +1,7 @@
 """码率优选 v1.4 补丁与巡检规划单测（宿主模块以桩替代）：python3 -m unittest discover tests"""
 import enum
 import importlib.util
+import os
 import sys
 import time
 import types
@@ -241,8 +242,6 @@ class MatchSubscribeTest(unittest.TestCase):
         self.assertIsNone(plugin._match_subscribe_id("星球", 1, subs))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 def _notice(media="玫瑰战争 S01", drop_ver="OurTV · Vivid HDR", drop_rate=4.8,
@@ -602,6 +601,44 @@ class LocalShadowTest(unittest.TestCase):
             self.assertEqual(len(plugin.messages), 1)
             os_path.rmdir()
             self.assertEqual(plugin._check_local_shadow(), [])
+
+
+class StaleSidecarTest(unittest.TestCase):
+    """边车码率与实际文件不符时改名为 .stale，等神医助手重新提取。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "Show - S01E01-mediainfo.json"
+        self.path.write_text("{}")
+        old = time.time() - 3 * 86400
+        os.utime(self.path, (old, old))
+        self.plugin = make_plugin()
+        self.plugin._retire_budget = 2
+        self.plugin._retired_sidecars = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_mismatch_renamed_to_stale(self):
+        self.assertTrue(self.plugin._retire_stale_sidecar(self.path, 5.1, 15.0))
+        self.assertFalse(self.path.exists())
+        self.assertTrue(self.path.with_name(self.path.name + ".stale").exists())
+        self.assertEqual(self.plugin._retire_budget, 1)
+
+    def test_small_difference_kept(self):
+        self.assertFalse(self.plugin._retire_stale_sidecar(self.path, 14.0, 15.0))
+        self.assertTrue(self.path.exists())
+
+    def test_fresh_sidecar_kept(self):
+        os.utime(self.path, None)
+        self.assertFalse(self.plugin._retire_stale_sidecar(self.path, 5.1, 15.0))
+        self.assertTrue(self.path.exists())
+
+    def test_budget_exhausted_kept(self):
+        self.plugin._retire_budget = 0
+        self.assertFalse(self.plugin._retire_stale_sidecar(self.path, 5.1, 15.0))
+        self.assertTrue(self.path.exists())
 
 
 if __name__ == "__main__":

@@ -69,3 +69,7 @@ SELECTION_NOTICE_KEY = "selection_notices"
 SELECTION_NOTICE_TTL_SECONDS = 24 * 3600
 # 补丁不兼容告警去重记录的存储键
 PATCH_ALERT_KEY = "patch_alert"
+# 过期边车改名：码率与实际文件相差超过该比例、生成超过一天的边车改名为 .stale，单轮上限
+STALE_SIDECAR_DIFF = 0.20
+STALE_SIDECAR_MIN_AGE_SECONDS = 86400
+STALE_SIDECAR_MAX_PER_RUN = 20

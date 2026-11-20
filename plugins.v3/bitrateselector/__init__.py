@@ -50,7 +50,7 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.6.2"
+    plugin_version = "1.7.0"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -78,6 +78,9 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
     _seed_verify_budget = 0
     # 最近一次巡检中「边车低码但实际文件已是高码」被忽略的条目数
     _last_scan_stale = 0
+    # 本轮剩余的过期边车改名额度与已改名列表
+    _retire_budget = 0
+    _retired_sidecars: List[str] = []
     # 整包码率放行标记：{id(context): (时间, 种子标题, 可洗集合)}
     _wash_marks: Dict[int, Tuple[float, str, Set[int]]] = {}
     # 各补丁当前状态：{函数名: "active" / "incompatible:<原因>" / "missing"}

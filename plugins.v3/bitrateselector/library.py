@@ -127,6 +127,7 @@ class LibraryMixin:
                     actual_bitrate = remote_size * 8 / runtime_seconds / 1_000_000
                     if actual_bitrate >= self._inspect_min_mbps:
                         stale_skipped += 1
+                        self._retire_stale_sidecar(info_path, bitrate, actual_bitrate)
                         continue
                     bitrate = round(actual_bitrate, 2)
             season_dir = info_path.parent
@@ -461,6 +462,8 @@ class LibraryMixin:
         if self._wash_enabled:
             self._safe_seed_baselines()
         cutoff = now - max(1, self._inspect_days) * 86400
+        self._retire_budget = STALE_SIDECAR_MAX_PER_RUN
+        self._retired_sidecars = []
         low_groups = self._scan_low_bitrate_items(cutoff)
         if not low_groups and not restored_rows:
             self.save_data(INSPECT_DEMOTIONS_KEY, demotions)
@@ -556,8 +559,11 @@ class LibraryMixin:
                 lines.append("以下低码集本轮未处理：")
                 lines.extend(idle_rows[:6])
             if self._last_scan_stale:
+                retired = len(self._retired_sidecars)
                 lines.append(
                     f"另有 {self._last_scan_stale} 个条目的边车显示低码，但实际文件已是高码（边车未刷新），已忽略"
+                    + (f"；其中 {retired} 个过期边车已改名为 .stale，Emby 下次刷新时由神医助手重新提取"
+                       if retired else "")
                 )
             if not_wash_rows:
                 lines.append("以下订阅未开启分集洗版，不自动处理：")
@@ -603,6 +609,8 @@ class LibraryMixin:
         corrected_total = 0
         matched = 0
         self._seed_verify_budget = SEED_VERIFY_MAX_PER_RUN
+        self._retire_budget = STALE_SIDECAR_MAX_PER_RUN
+        self._retired_sidecars = []
         for subscribe in subscriptions:
             seeded, corrected = self._seed_subscription_baseline(subscribe, root)
             if seeded < 0:
@@ -683,6 +691,7 @@ class LibraryMixin:
                 if actual is not None:
                     bitrate = actual
                     verified = True
+                    self._retire_stale_sidecar(info_path, sidecar, actual)
                 elif has_floor:
                     # 核实失败且有下限：不拿可能过期的边车覆盖，保留下限
                     continue
@@ -828,6 +837,38 @@ class LibraryMixin:
                 f"码率优选：strm 实际大小获取失败（{strm_path.name}）：{err}"
             )
             return True, None
+
+    def _retire_stale_sidecar(self, info_path: Path, sidecar_mbps: float, actual_mbps: float) -> bool:
+        """
+        边车码率与实际文件相差超过阈值时，把边车改名为 .stale 备份。
+
+        神医助手持久化的 -mediainfo.json 在洗版换文件后不会自动更新，Emby 刷新时
+        仍会读回旧版本的媒体信息；移走后由神医助手在下次刷新时重新提取。
+        只处理生成超过一天的边车，单轮有额度上限；改名而非删除，便于手动恢复。
+
+        :return: 是否已改名
+        """
+        if self._retire_budget <= 0 or not sidecar_mbps or not actual_mbps:
+            return False
+        if abs(actual_mbps - sidecar_mbps) <= sidecar_mbps * STALE_SIDECAR_DIFF:
+            return False
+        try:
+            if time.time() - info_path.stat().st_mtime < STALE_SIDECAR_MIN_AGE_SECONDS:
+                return False
+            target = info_path.with_name(info_path.name + ".stale")
+            if target.exists():
+                target = info_path.with_name(f"{info_path.name}.{int(time.time())}.stale")
+            info_path.rename(target)
+        except OSError as err:
+            logger.warning(f"码率优选：过期边车改名失败 {info_path}：{err}")
+            return False
+        self._retire_budget -= 1
+        self._retired_sidecars.append(info_path.name)
+        logger.info(
+            f"码率优选：边车码率 {sidecar_mbps:.1f}Mbps 与实际文件 {actual_mbps:.1f}Mbps 不符，"
+            f"已改名为 .stale 待神医助手重新提取：{info_path}"
+        )
+        return True
 
     def _verified_library_bitrate(self, info_path: Path) -> Tuple[Optional[float], str]:
         """
