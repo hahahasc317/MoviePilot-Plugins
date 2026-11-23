@@ -28,11 +28,14 @@ from .wash import WashMixin
 from .library import LibraryMixin
 from .selection import SelectionMixin
 from .estimation import EstimationMixin
+from .cleanup import CleanupMixin
 
 
 
 
-class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, EstimationMixin, _PluginBase):
+class BitrateSelector(
+    PatchMixin, WashMixin, LibraryMixin, SelectionMixin, EstimationMixin, CleanupMixin, _PluginBase
+):
     """
     码率优选：在下载执行前对比候选资源对每集的估算码率，自动保留高码率资源。
 
@@ -50,7 +53,7 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.7.3"
+    plugin_version = "1.8.0"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -67,6 +70,8 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
     _inspect_enabled = False
     _inspect_min_mbps = 8.0
     _inspect_days = 30
+    _min_seeders = DEFAULT_MIN_SEEDERS
+    _cleanup_enabled = True
     _baselines: Dict[str, Dict[str, Any]] = {}
     # 基线读改写锁：下载事件、播种线程、定时任务会并发修改 _baselines
     _baseline_lock = threading.RLock()
@@ -166,6 +171,15 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
             self._inspect_days = max(1, int(float(config.get("inspect_days") or 30)))
         except (TypeError, ValueError):
             self._inspect_days = 30
+        raw_seeders = config.get("min_seeders")
+        try:
+            self._min_seeders = max(
+                0, int(float(DEFAULT_MIN_SEEDERS if raw_seeders in (None, "") else raw_seeders))
+            )
+        except (TypeError, ValueError):
+            self._min_seeders = DEFAULT_MIN_SEEDERS
+        # 旧配置没有这个键时按默认开启
+        self._cleanup_enabled = bool(config.get("cleanup_enabled", True))
         with self._baseline_lock:
             self._baselines = self.get_data(WASH_BASELINES_KEY) or {}
             self._migrate_inflated_floors()
@@ -396,6 +410,42 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "min_seeders",
+                                            "label": "洗版最少做种人数",
+                                            "type": "number",
+                                            "hint": "做种少于此数的种子不用于洗版（缺集补齐不受影响），0 关闭，默认 3",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "cleanup_enabled",
+                                            "label": "清理被替代的停滞下载",
+                                            "hint": "同一集已由其他种子入库时，删除停在 0% 超过 6 小时的订阅下载",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -439,6 +489,8 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
             "inspect_enabled": False,
             "inspect_min_mbps": 8.0,
             "inspect_days": 30,
+            "min_seeders": DEFAULT_MIN_SEEDERS,
+            "cleanup_enabled": True,
         }
         return form, defaults
 
@@ -525,6 +577,16 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
                     "kwargs": {},
                 }
             )
+        if self._enabled and self._wash_enabled and self._cleanup_enabled:
+            services.append(
+                {
+                    "id": "BitrateSelectorCleanupSuperseded",
+                    "name": "清理被替代的停滞下载",
+                    "trigger": CronTrigger.from_crontab("15 * * * *"),
+                    "func": self._safe_cleanup_superseded,
+                    "kwargs": {},
+                }
+            )
         if self._enabled and self._inspect_enabled:
             services.append(
                 {
@@ -593,8 +655,20 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
         """整理入库后按实际文件大小记录该集码率基线（覆盖下载前的估算值）。"""
         if not (self._enabled and self._wash_enabled):
             return
+        data = getattr(event, "event_data", None)
         try:
-            self._record_transferred_baseline(getattr(event, "event_data", None))
+            self._record_transferred_baseline(data)
         except Exception as err:
             logger.warning(f"码率优选：入库实测记录基线失败：{err}")
+        if not self._cleanup_enabled:
+            return
+        try:
+            noted = self._note_transfer_marks(data)
+        except Exception as err:
+            logger.warning(f"码率优选：记录入库集失败：{err}")
+            noted = None
+        if noted:
+            threading.Thread(
+                target=self._safe_cleanup_superseded, name="bitrateselector-cleanup", daemon=True
+            ).start()
 

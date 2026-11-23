@@ -85,6 +85,14 @@ class WashMixin:
             floor = self._floor_value(baseline_entry.get("full_floor"))
             effective_baseline = max(float(baseline), floor) if floor else float(baseline)
             if candidate_mbps > effective_baseline * (1 + effective_margin):
+                low = self._low_seeders(context)
+                if low is not None:
+                    logger.info(
+                        f"码率优选：全集洗版候选 {candidate_mbps:.1f}Mbps 做种仅 {low} 人，"
+                        f"低于 {self._min_seeders} 人，不用于洗版"
+                        f"（{(getattr(context.torrent_info, 'title', '') or '')[:60]}）"
+                    )
+                    return False
                 logger.info(
                     f"码率优选：全集洗版准入 {candidate_mbps:.1f}Mbps 超过基线 "
                     f"{effective_baseline:.1f}Mbps（需 +{effective_margin:.0%}，"
@@ -258,6 +266,15 @@ class WashMixin:
                 )
             washable_eps = list(interested)
             interested = sorted(set(interested) | set(pending_new))
+        low = self._low_seeders(context)
+        if low is not None and washable_eps:
+            logger.info(
+                f"码率优选：候选做种仅 {low} 人，低于 {self._min_seeders} 人，"
+                f"{self._compress_episode_ranges(sorted(washable_eps))} 不用于洗版，"
+                f"缺集补齐不受影响（{title}）"
+            )
+            washable_eps = []
+            interested = sorted(set(pending_new))
         self._mark_wash_candidate(context, washable_eps)
         if interested:
             episode_range = (
@@ -277,6 +294,28 @@ class WashMixin:
                 f"候选 {candidate_mbps:.1f}Mbps 未超已提交估算，拒绝防同集降级（{title}）"
             )
         return interested
+
+    def _low_seeders(self, context: Any) -> Optional[int]:
+        """
+        候选做种人数低于设定下限时返回做种数，否则返回 None。
+
+        只用于洗版：库里已有版本时没必要去下几乎没人做种的种子。
+        下限为 0 表示关闭；做种数缺失或为 0 视为未知（RSS 来源常不带做种数），不拦截。
+        """
+        try:
+            minimum = int(self._min_seeders)
+        except (TypeError, ValueError):
+            return None
+        if minimum <= 0:
+            return None
+        torrent = getattr(context, "torrent_info", None)
+        try:
+            seeders = int(getattr(torrent, "seeders", None) or 0)
+        except (TypeError, ValueError):
+            return None
+        if seeders <= 0:
+            return None
+        return seeders if seeders < minimum else None
 
     @staticmethod
     def _candidate_episode_span(
@@ -360,9 +399,24 @@ class WashMixin:
                 return None
         else:
             target = getattr(info, "target_item", None)
-            size = int(getattr(target, "size", 0) or 0) or int(getattr(info, "total_size", 0) or 0)
-            name = str(getattr(target, "name", "") or "")
-            if size < TRANSFER_MIN_VIDEO_BYTES or (name and not name.lower().endswith(VIDEO_EXTS)):
+            # 网盘存储的目标文件项常不带大小，依次回退到整理总大小、源文件大小
+            size = (
+                int(getattr(target, "size", 0) or 0)
+                or int(getattr(info, "total_size", 0) or 0)
+                or int(getattr(getattr(info, "fileitem", None), "size", 0) or 0)
+                or int(getattr(getattr(data, "fileitem", None), "size", 0) or 0)
+            )
+            name = str(
+                getattr(target, "name", "")
+                or getattr(getattr(data, "fileitem", None), "name", "")
+                or ""
+            )
+            if name and not name.lower().endswith(VIDEO_EXTS):
+                return None
+            if size < TRANSFER_MIN_VIDEO_BYTES:
+                logger.info(
+                    f"码率优选：入库文件大小未知或过小（{size} 字节），未记录实测基线（{name[:60]}）"
+                )
                 return None
         season = int(getattr(meta, "begin_season", None) or 1)
         key = self._transfer_media_key(media, season)
@@ -371,6 +425,7 @@ class WashMixin:
         minutes_map, source = self._resolve_episode_minutes(media, season, set(episodes))
         total_minutes = sum((minutes_map or {}).values())
         if total_minutes <= 0:
+            logger.info(f"码率优选：{key} {episodes} 缺单集时长，未记录入库实测基线")
             return None
         mbps = round(size * 8 / (total_minutes * 60) / 1_000_000, 2)
         if mbps > IMPLAUSIBLE_WEB_MBPS and not DISC_SOURCE_RE.search(name):

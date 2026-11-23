@@ -78,3 +78,10 @@ STALE_SIDECAR_MAX_PER_RUN = 20
 # 媒体库实际存在集号的判定：文件扩展名与缓存时长
 LIBRARY_EPISODE_EXTS = (".strm", ".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".iso", ".webm")
 LIBRARY_PRESENT_TTL_SECONDS = 600
+# 洗版准入的最少做种人数默认值（0 关闭；做种数缺失或为 0 视为未知不拦截）
+DEFAULT_MIN_SEEDERS = 3
+# 入库记录：{媒体:季: {集号: 入库时间}}，用于判断旧下载任务是否已被其他种子替代
+TRANSFER_MARKS_KEY = "transfer_marks"
+TRANSFER_MARKS_TTL_SECONDS = 30 * 86400
+# 停在 0% 的旧任务至少添加这么久才清理，避免误删刚提交、尚未开始的任务
+CLEANUP_MIN_AGE_SECONDS = 6 * 3600

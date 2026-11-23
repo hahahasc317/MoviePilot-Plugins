@@ -178,13 +178,18 @@ class SelectionMixin:
                 (idx, episodes, bitrate, title, media_label, version_label)
             )
         drop: Dict[int, Tuple[str, Dict[str, Any]]] = {}
+        # 做种不足的候选不能淘汰别人：码率再高，下不动也没用
+        weak = {
+            idx for idx, ctx in enumerate(contexts)
+            if isinstance(ctx, Context) and self._low_seeders(ctx) is not None
+        }
         margin = max(0, int(self._margin_percent)) / 100.0
         for items in groups.values():
             for idx, eps, bitrate, title, media_label, version_label in items:
                 if idx in drop:
                     continue
                 for jdx, eps2, bitrate2, title2, label2, version2 in items:
-                    if jdx == idx or jdx in drop:
+                    if jdx == idx or jdx in drop or jdx in weak:
                         continue
                     if not self._covers(eps2, eps):
                         continue

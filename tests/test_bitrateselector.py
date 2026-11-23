@@ -792,5 +792,163 @@ class RepairMissingRecordsTest(unittest.TestCase):
         self.assertEqual(written[9]["lack_episode"], 2)
 
 
+class SeedersGateTest(unittest.TestCase):
+    """复现把黑夜点燃 E10-E12：码率高 35% 但只有 1 人做种的单集种子被选去洗版，挂了两天 0%。"""
+
+    def _sub(self):
+        return make_subscribe(id=108, name="把黑夜点燃", total_episode=12, media_id="288328",
+                              episode_priority={str(e): 96 for e in range(1, 13)})
+
+    def _ctx(self, eps, seeders, size_gb=4.3):
+        return NS(
+            torrent_info=NS(size=int(size_gb * 1024 ** 3), title="Ba Hei Ye Dian Ran S01E12 2160p LongWeb",
+                            pri_order=100, seeders=seeders),
+            meta_info=NS(begin_season=1, begin_episode=eps[0] if eps else None, end_episode=None,
+                         total_episode=None, episode_list=list(eps)),
+            media_info=NS(tmdb_id=288328, title="把黑夜点燃", year="2026", type=MediaType.TV,
+                          media_source="themoviedb", media_id="288328"),
+            selected_episodes=None, allowed_episodes=None,
+        )
+
+    def _plugin(self, present=None):
+        plugin = make_plugin(_min_seeders=3)
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 13)}
+        plugin._baselines = {"themoviedb:288328:1": {"episodes": {str(e): 10.0 for e in range(1, 13)}}}
+        plugin._library_present_episodes = lambda subscribe: present
+        return plugin
+
+    def test_low_seeders_blocked_for_wash(self):
+        self.assertFalse(self._plugin()._wash_admit(self._sub(), self._ctx([12], 1), 100, lambda *a: True))
+
+    def test_enough_seeders_admitted(self):
+        self.assertTrue(self._plugin()._wash_admit(self._sub(), self._ctx([12], 6), 100, lambda *a: False))
+
+    def test_unknown_seeders_not_blocked(self):
+        self.assertTrue(self._plugin()._wash_admit(self._sub(), self._ctx([12], 0), 100, lambda *a: False))
+        self.assertTrue(self._plugin()._wash_admit(self._sub(), self._ctx([12], None), 100, lambda *a: False))
+
+    def test_disabled_when_zero(self):
+        plugin = self._plugin()
+        plugin._min_seeders = 0
+        self.assertTrue(plugin._wash_admit(self._sub(), self._ctx([12], 1), 100, lambda *a: False))
+
+    def test_missing_episode_still_downloaded(self):
+        plugin = self._plugin(present=set(range(1, 12)))
+        prio = {str(e): 96 for e in range(1, 12)}
+        sub = make_subscribe(id=108, name="把黑夜点燃", total_episode=12, media_id="288328",
+                             episode_priority=prio)
+        plugin._baselines = {"themoviedb:288328:1": {"episodes": {str(e): 10.0 for e in range(1, 12)}}}
+        ctx = self._ctx([12], 1)
+        self.assertTrue(plugin._wash_admit(sub, ctx, 100, lambda *a: False))
+        self.assertEqual(ctx.allowed_episodes, {12})
+
+    def test_full_mode_low_seeders_rejected(self):
+        plugin = self._plugin()
+        plugin._baselines = {"themoviedb:288328:1": {"full": 10.0}}
+        sub = make_subscribe(id=108, total_episode=12, media_id="288328", best_version_full=1)
+        pack = self._ctx([], 1, size_gb=57)
+        pack.meta_info.begin_episode = None
+        self.assertFalse(plugin._wash_admit(sub, pack, 100, lambda *a: True))
+        pack.torrent_info.seeders = 14
+        self.assertTrue(plugin._wash_admit(sub, pack, 100, lambda *a: False))
+
+    def test_weak_candidate_cannot_eliminate_others(self):
+        plugin = self._plugin()
+        strong = self._ctx([12], 1, size_gb=5.0)
+        healthy = self._ctx([12], 8, size_gb=3.0)
+        kept, dropped, _ = plugin._drop_dominated_candidates([strong, healthy])
+        self.assertEqual(len(kept), 2)
+        self.assertFalse(dropped)
+        strong.torrent_info.seeders = 9
+        kept, dropped, _ = plugin._drop_dominated_candidates([strong, healthy])
+        self.assertEqual(kept, [strong])
+
+
+class CleanupSupersededTest(unittest.TestCase):
+    """E10-E12 已由 UBWEB 整季包入库后，旧的 LongWeb 单集任务停在 0%，应自动清理。"""
+
+    NOW = 1_800_000_000.0
+
+    def _torrent(self, h, eps="E12", progress=0.0, season="S01", media_id="288328"):
+        return NS(hash=h, progress=progress, downloader="qb", title=f"LongWeb {eps}", name="把黑夜点燃",
+                  media=NS(media_source="themoviedb", media_id=media_id, season=season, episode=eps,
+                           title="把黑夜点燃"))
+
+    def _history(self, hours_ago, source="Subscribe|把黑夜点燃 S01"):
+        from datetime import datetime
+        date = datetime.fromtimestamp(self.NOW - hours_ago * 3600).strftime("%Y-%m-%d %H:%M:%S")
+        return NS(date=date, note={"source": source})
+
+    def _marks(self, eps, hours_ago):
+        return {"themoviedb:288328:1": {str(e): self.NOW - hours_ago * 3600 for e in eps}}
+
+    def test_parse_helpers(self):
+        P = bs.BitrateSelector
+        self.assertEqual(P._parse_episodes("E10-E12"), {10, 11, 12})
+        self.assertEqual(P._parse_episodes("E05"), {5})
+        self.assertEqual(P._parse_episodes([3, 4]), {3, 4})
+        self.assertEqual(P._parse_episodes(""), set())
+        self.assertEqual(P._parse_season("S01"), 1)
+        self.assertEqual(P._parse_season([2]), 2)
+        self.assertIsNone(P._parse_season("S01-S02"))
+
+    def test_superseded_stalled_task_planned(self):
+        plugin = make_plugin()
+        plan = plugin._plan_superseded(
+            [self._torrent("a")], {"a": self._history(48)}, self._marks([10, 11, 12], 22), self.NOW)
+        self.assertEqual(len(plan), 1)
+
+    def test_keeps_tasks_with_progress_or_too_new_or_manual(self):
+        plugin = make_plugin()
+        marks = self._marks([10, 11, 12], 1)
+        self.assertFalse(plugin._plan_superseded(
+            [self._torrent("a", progress=0.5)], {"a": self._history(48)}, marks, self.NOW))
+        self.assertFalse(plugin._plan_superseded(
+            [self._torrent("a")], {"a": self._history(3)}, marks, self.NOW))
+        self.assertFalse(plugin._plan_superseded(
+            [self._torrent("a")], {"a": self._history(48, source="Manual|web")}, marks, self.NOW))
+
+    def test_keeps_task_when_episode_not_replaced_after_it_was_added(self):
+        plugin = make_plugin()
+        # 入库发生在任务添加之前：库里那一版是旧的，任务可能正是来升级它的
+        self.assertFalse(plugin._plan_superseded(
+            [self._torrent("a")], {"a": self._history(48)}, self._marks([12], 60), self.NOW))
+        # 任务覆盖 E10-E12，只有 E12 被替代
+        self.assertFalse(plugin._plan_superseded(
+            [self._torrent("a", eps="E10-E12")], {"a": self._history(48)}, self._marks([12], 22), self.NOW))
+        # 不同季
+        self.assertFalse(plugin._plan_superseded(
+            [self._torrent("a", season="S02")], {"a": self._history(48)}, self._marks([12], 22), self.NOW))
+
+    def test_transfer_marks_recorded(self):
+        plugin = make_plugin()
+        data = NS(
+            transferinfo=NS(success=True),
+            meta=NS(episode_list=[10], begin_season=1, begin_episode=10),
+            mediainfo=NS(type="电视剧", media_source="themoviedb", media_id="288328", tmdb_id=288328),
+        )
+        key, eps = plugin._note_transfer_marks(data)
+        self.assertEqual((key, eps), ("themoviedb:288328:1", [10]))
+        self.assertIn("10", plugin.get_data("transfer_marks")[key])
+
+
+class TransferSizeFallbackTest(unittest.TestCase):
+    """网盘目标文件项不带大小时，回退到源文件大小记录入库实测基线。"""
+
+    def test_uses_source_fileitem_size(self):
+        plugin = make_plugin()
+        size = int(4.63 * 1024 ** 3)
+        data = NS(
+            transferinfo=NS(success=True, file_count=1, total_size=0,
+                            target_item=NS(size=None, name="把黑夜点燃 - S01E12.mkv"), fileitem=None),
+            fileitem=NS(size=size, name="Light.the.Dark.S01E12.UBWEB.mkv"),
+            meta=NS(episode_list=[12], begin_season=1, begin_episode=12),
+            mediainfo=NS(type="电视剧", media_source="themoviedb", media_id="288328", tmdb_id=288328),
+        )
+        result = plugin._record_transferred_baseline(data)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result[2], round(size * 8 / (45 * 60) / 1e6, 2), places=2)
+
+
 if __name__ == "__main__":
     unittest.main()
