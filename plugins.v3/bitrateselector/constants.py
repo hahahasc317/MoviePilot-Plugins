@@ -73,3 +73,6 @@ PATCH_ALERT_KEY = "patch_alert"
 STALE_SIDECAR_DIFF = 0.20
 STALE_SIDECAR_MIN_AGE_SECONDS = 86400
 STALE_SIDECAR_MAX_PER_RUN = 20
+# 媒体库实际存在集号的判定：文件扩展名与缓存时长
+LIBRARY_EPISODE_EXTS = (".strm", ".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".iso", ".webm")
+LIBRARY_PRESENT_TTL_SECONDS = 600

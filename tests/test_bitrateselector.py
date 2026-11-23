@@ -641,5 +641,58 @@ class StaleSidecarTest(unittest.TestCase):
         self.assertTrue(self.path.exists())
 
 
+class LibraryPresenceTest(unittest.TestCase):
+    """复现尚公主 E26：订阅无下载记录、库里也没有文件，却因残留基线被当成已有集比码率而补不回来。"""
+
+    def _sub(self):
+        prio = {str(e): 100 for e in range(1, 41)}
+        prio.pop("26")
+        return make_subscribe(id=114, name="尚公主", total_episode=40, media_id="114",
+                              episode_priority=prio)
+
+    def _ctx(self, eps):
+        return NS(
+            torrent_info=NS(size=int(2 * 1024 ** 3), title="Shang Gong Zhu S01E26 2160p WEB-DL", pri_order=100),
+            meta_info=NS(begin_season=1, begin_episode=eps[0], end_episode=None, total_episode=None,
+                         episode_list=list(eps)),
+            media_info=NS(tmdb_id=114, title="尚公主", year="2026", media_source="themoviedb", media_id="114"),
+            selected_episodes=None, allowed_episodes=None,
+        )
+
+    def _plugin(self, present):
+        plugin = make_plugin()
+        plugin._episode_runtimes = lambda media, season: {ep: 45 for ep in range(1, 41)}
+        plugin._baselines = {"themoviedb:114:1": {"episodes": {str(e): 15.0 for e in range(1, 41)}}}
+        plugin._library_present_episodes = lambda subscribe: present
+        return plugin
+
+    def test_really_missing_episode_admitted_despite_stale_baseline(self):
+        plugin = self._plugin(present=set(range(1, 41)) - {26})
+        # 约 6Mbps 的单集，远低于残留基线 15Mbps，但库里没有 E26，应按补缺放行
+        self.assertTrue(plugin._wash_admit(self._sub(), self._ctx([26]), 100, lambda *a: False))
+
+    def test_episode_in_library_without_record_still_compared(self):
+        plugin = self._plugin(present=set(range(1, 41)))
+        # 库里已有 E26：仍按基线比较，低码不放行
+        self.assertFalse(plugin._wash_admit(self._sub(), self._ctx([26]), 100, lambda *a: True))
+
+    def test_unknown_library_keeps_old_behavior(self):
+        plugin = self._plugin(present=None)
+        self.assertFalse(plugin._wash_admit(self._sub(), self._ctx([26]), 100, lambda *a: True))
+
+    def test_present_episodes_scan(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            season = Path(tmp) / "国产剧" / "尚公主 (2026)" / "Season 1"
+            season.mkdir(parents=True)
+            for e in (1, 2, 25, 27):
+                (season / f"尚公主 (2026) - S01E{e:02d} - 第 {e} 集.strm").write_text("x")
+            (season / "尚公主 (2026) - S01E26 - 第 26 集-mediainfo.json").write_text("{}")
+            (season / "尚公主 (2026) - S01E03-E04.mkv").write_text("x")
+            plugin = make_plugin(_library_root=tmp, _present_cache={})
+            got = plugin._library_present_episodes(make_subscribe(name="尚公主", year="2026", season=1))
+            self.assertEqual(got, {1, 2, 3, 4, 25, 27})
+
+
 if __name__ == "__main__":
     unittest.main()

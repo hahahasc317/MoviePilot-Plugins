@@ -152,6 +152,17 @@ class WashMixin:
         downloaded = set(
             subscription_priority.get_downloaded_best_version_episodes(subscribe)
         )
+        # 订阅无下载记录的集按媒体库实际文件区分：库里没有 → 真缺，按补缺放行，
+        # 不拿可能来自未完成下载的基线去比；库里有 → 按码率比较，防止低码覆盖
+        present = self._library_present_episodes(subscribe)
+
+        def _really_missing(episode: int) -> bool:
+            """订阅无下载记录且媒体库里确实没有该集文件。"""
+            return episode not in downloaded and present is not None and episode not in present
+
+        def _known_in_library(episode: int) -> bool:
+            """订阅无下载记录但媒体库里已有该集文件（不当作新集补缺）。"""
+            return episode not in downloaded and present is not None and episode in present
 
         def _threshold_for(baseline_source: str) -> float:
             """按候选与基线的时长来源是否一致计算该集的比较阈值。"""
@@ -177,8 +188,20 @@ class WashMixin:
                 for episode in target_episodes
                 if episode_baselines.get(str(episode)) is None
             ]
-            pending_new = sorted(ep for ep in missing if ep not in downloaded)
-            skipped_known = len(missing) - len(pending_new)
+            pending_new = sorted(
+                ep for ep in missing if ep not in downloaded and not _known_in_library(ep)
+            )
+            phantom = sorted(
+                ep for ep in target_episodes
+                if episode_baselines.get(str(ep)) is not None and _really_missing(ep)
+            )
+            if phantom:
+                logger.info(
+                    f"码率优选：{self._compress_episode_ranges(phantom)} 订阅无下载记录且媒体库无文件，"
+                    "忽略残留基线按补缺放行"
+                )
+                pending_new = sorted(set(pending_new) | set(phantom))
+            skipped_known = len(missing) - len([ep for ep in pending_new if ep in missing])
             if skipped_known:
                 logger.debug(
                     f"码率优选：{skipped_known} 集已下载但缺基线，本轮不参与码率优先洗版"
@@ -191,6 +214,7 @@ class WashMixin:
                 episode
                 for episode in target_episodes
                 if (baseline := episode_baselines.get(str(episode))) is not None
+                and episode not in phantom
                 and _admit_by_baseline(
                     episode,
                     _threshold_for(str(baseline_sources.get(str(episode), "measured"))),
@@ -210,8 +234,11 @@ class WashMixin:
                 if episode_num not in target_episodes:
                     continue
                 baseline = episode_baselines.get(str(episode_num))
+                if _really_missing(episode_num):
+                    pending_new.append(episode_num)
+                    continue
                 if baseline is None:
-                    if episode_num in downloaded:
+                    if episode_num in downloaded or _known_in_library(episode_num):
                         skipped_known += 1
                     else:
                         pending_new.append(episode_num)

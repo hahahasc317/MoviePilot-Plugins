@@ -764,6 +764,41 @@ class LibraryMixin:
                     next_level.append(child)
             current = next_level
 
+    def _library_present_episodes(self, subscribe: Any) -> Optional[Set[int]]:
+        """
+        列出订阅对应季目录中实际存在 strm/视频文件的集号。
+
+        订阅里没有下载记录的集，既可能是真缺，也可能是库里已有但不是由该订阅下载的；
+        以媒体库文件为准区分两者。找不到剧集或季目录时返回 None（无法判断）。
+        结果缓存 LIBRARY_PRESENT_TTL_SECONDS 秒。
+        """
+        name = str(getattr(subscribe, "name", "") or "")
+        year = getattr(subscribe, "year", None)
+        season = int(getattr(subscribe, "season", None) or 1)
+        cache_key = f"{name}|{year}|{season}"
+        cached = self._present_cache.get(cache_key)
+        if cached is not None and time.time() - cached[0] < LIBRARY_PRESENT_TTL_SECONDS:
+            return cached[1]
+        result: Optional[Set[int]] = None
+        try:
+            root = Path(self._library_root)
+            show_dir = self._find_show_dir(root, name, year) if root.is_dir() else None
+            season_dir = self._find_season_dir(show_dir, season) if show_dir else None
+            if season_dir is not None:
+                result = set()
+                for child in season_dir.iterdir():
+                    if not child.name.lower().endswith(LIBRARY_EPISODE_EXTS):
+                        continue
+                    matched = re.search(r"S\d+E(\d+)(?:-?E(\d+))?", child.name, re.IGNORECASE)
+                    if matched:
+                        start = int(matched.group(1))
+                        end = int(matched.group(2) or start)
+                        result.update(range(start, end + 1))
+        except OSError:
+            result = None
+        self._present_cache[cache_key] = (time.time(), result)
+        return result
+
     @staticmethod
     def _find_season_dir(show_dir: Path, season: int) -> Optional[Path]:
         """在剧集目录内定位指定季的目录，兼容 Season 1 与 Season 01。"""
