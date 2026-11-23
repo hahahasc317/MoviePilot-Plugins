@@ -33,6 +33,7 @@ class LibraryMixin:
             logger.info("码率优选：已有库内播种在运行，本次跳过")
             return {"success": False, "seeded": 0, "message": "播种进行中"}
         try:
+            self._safe_repair_missing_records()
             with self._baseline_lock:
                 return self.seed_baselines_from_library()
         except Exception as err:
@@ -40,6 +41,97 @@ class LibraryMixin:
             return {"success": False, "seeded": 0, "message": str(err)}
         finally:
             self._seed_lock.release()
+
+    def _safe_repair_missing_records(self) -> Dict[str, Any]:
+        """补记缺失的分集记录并吞掉异常。"""
+        try:
+            return self._repair_missing_records()
+        except Exception as err:
+            logger.error(f"码率优选：补记分集记录失败：{err}")
+            return {"success": False, "repaired": 0, "message": str(err)}
+
+    @staticmethod
+    def _plan_repair(subscribe: Any, present: Set[int]) -> List[int]:
+        """
+        找出订阅目标范围内「媒体库已有文件、订阅却没有任何版本记录」的集。
+
+        洗版订阅按 note 与 episode_priority>0 统计已下载集，这些集会被显示为缺集、
+        被当作新集反复搜索。
+        """
+        total = int(getattr(subscribe, "total_episode", None) or 0)
+        start = int(getattr(subscribe, "start_episode", None) or 1)
+        if total < start:
+            return []
+        recorded: Set[int] = set()
+        for episode in getattr(subscribe, "note", None) or []:
+            try:
+                recorded.add(int(episode))
+            except (TypeError, ValueError):
+                continue
+        for key, priority in subscription_priority.get_episode_priority(subscribe).items():
+            try:
+                if float(priority) > 0:
+                    recorded.add(int(key))
+            except (TypeError, ValueError):
+                continue
+        return [e for e in range(start, total + 1) if e in present and e not in recorded]
+
+    def _repair_missing_records(self) -> Dict[str, Any]:
+        """
+        为分集洗版订阅补记库里已有、订阅却无记录的集，并重算缺失集数。
+
+        补记优先级为 REPAIR_EPISODE_PRIORITY（>0 即视为已有版本，低于任何规则分），
+        这些集仍会继续洗版，只是不再显示为缺集、不再当作新集无条件下载。
+        媒体库目录找不到时不处理。
+        """
+        from app.db.session import SessionFactory  # pylint: disable=import-outside-toplevel
+
+        if not (self._enabled and self._wash_enabled):
+            return {"success": False, "repaired": 0}
+        rows: List[str] = []
+        total_repaired = 0
+        for subscribe in SubscribeOper().list() or []:
+            if getattr(subscribe, "type", None) != MediaType.TV.value:
+                continue
+            if not getattr(subscribe, "best_version", False):
+                continue
+            if subscription_priority.is_full_best_version_enabled(subscribe):
+                continue
+            present = self._library_present_episodes(subscribe)
+            if not present:
+                continue
+            if not self._plan_repair(subscribe, present):
+                continue
+            sid = int(getattr(subscribe, "id", 0) or 0)
+            with SessionFactory() as session:
+                oper = SubscribeOper(session)
+                current = oper.get(sid)
+                if current is None:
+                    continue
+                missing = self._plan_repair(current, present)
+                if not missing:
+                    continue
+                merged = dict(subscription_priority.get_episode_priority(current))
+                for episode in missing:
+                    merged[str(episode)] = REPAIR_EPISODE_PRIORITY
+                lack = max(0, int(getattr(current, "lack_episode", 0) or 0) - len(missing))
+                oper.update(sid, {"episode_priority": merged, "lack_episode": lack})
+                session.commit()
+            total_repaired += len(missing)
+            label = f"{getattr(subscribe, 'name', sid)} {self._compress_episode_ranges(missing)}"
+            rows.append(f"· {label}")
+            logger.info(f"码率优选：{label} 媒体库已有但订阅无记录，已补记，不再显示为缺集")
+        if rows and self._notify:
+            self.post_message(
+                mtype=None,
+                title="码率优选：补记已入库集",
+                text=(
+                    "以下集媒体库里已有、订阅却没有记录（会显示缺集并被反复搜索），已补记：\n"
+                    + "\n".join(rows[:10])
+                    + "\n（仍会按码率继续洗版）"
+                ),
+            )
+        return {"success": True, "repaired": total_repaired}
 
     def _safe_low_bitrate_inspect(self) -> Dict[str, Any]:
         """执行低码巡检并吞掉异常，返回结果摘要。"""

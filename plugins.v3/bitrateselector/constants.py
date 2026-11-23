@@ -21,6 +21,8 @@ INSPECT_DEMOTIONS_KEY = "inspect_demotions"
 # 核心「已完成洗版」的分集优先级（规则满分）与巡检降级后的待洗优先级
 FULL_EPISODE_PRIORITY = 100
 DEMOTED_EPISODE_PRIORITY = 99
+# 补记「库里已有但订阅无记录」的集时写入的优先级：>0 表示已有版本，低于任何规则分，仍可被洗版
+REPAIR_EPISODE_PRIORITY = 1
 # 单轮巡检最多降级的集数，防止一次性放出大量洗版搜索
 INSPECT_MAX_DEMOTE_PER_ROUND = 20
 # 降级后未洗到更高码版本的恢复期限，以及恢复后同集的冷却期

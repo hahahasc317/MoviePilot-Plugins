@@ -737,5 +737,60 @@ class WriteEpisodePriorityMergeTest(unittest.TestCase):
         bs_library.LibraryMixin._write_episode_priority(7, {})
 
 
+class RepairMissingRecordsTest(unittest.TestCase):
+    """库里已有、订阅无记录的集补记为已下载。"""
+
+    def test_plan_repair_only_present_and_unrecorded(self):
+        sub = make_subscribe(total_episode=10, start_episode=0, note=[4, 5],
+                             episode_priority={"1": 0, "4": 87, "5": 87, "6": 95, "7": 0})
+        present = {1, 2, 3, 4, 5, 6, 9}
+        self.assertEqual(bs_library.LibraryMixin._plan_repair(sub, present), [1, 2, 3, 9])
+
+    def test_plan_repair_respects_start_episode(self):
+        sub = make_subscribe(total_episode=20, start_episode=15, note=[], episode_priority={})
+        self.assertEqual(bs_library.LibraryMixin._plan_repair(sub, {1, 15, 16}), [15, 16])
+
+    def test_repair_writes_merged_priority_and_lack(self):
+        sub = make_subscribe(id=9, name="华灯起", total_episode=6, start_episode=0, note=[5],
+                             lack_episode=5, episode_priority={"5": 95, "6": 0})
+        written = {}
+
+        class FakeOper:
+            def __init__(self, session=None):
+                pass
+
+            def list(self):
+                return [sub]
+
+            def get(self, sid):
+                return sub
+
+            def update(self, sid, payload):
+                written[sid] = payload
+
+        class FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def commit(self):
+                pass
+
+        _stub("app.db.session", SessionFactory=FakeSession)
+        old = bs_library.SubscribeOper
+        bs_library.SubscribeOper = FakeOper
+        try:
+            plugin = make_plugin(_notify=False)
+            plugin._library_present_episodes = lambda s: {1, 2, 3, 5}
+            result = plugin._repair_missing_records()
+        finally:
+            bs_library.SubscribeOper = old
+        self.assertEqual(result["repaired"], 3)
+        self.assertEqual(written[9]["episode_priority"], {"1": 1, "2": 1, "3": 1, "5": 95, "6": 0})
+        self.assertEqual(written[9]["lack_episode"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
