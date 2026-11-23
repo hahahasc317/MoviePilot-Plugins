@@ -950,5 +950,40 @@ class TransferSizeFallbackTest(unittest.TestCase):
         self.assertAlmostEqual(result[2], round(size * 8 / (45 * 60) / 1e6, 2), places=2)
 
 
+class TransferEventDictTest(unittest.TestCase):
+    """V3 的整理完成事件经持久化投递，event_data 是字典：旧代码按属性读取永远拿不到，入库实测从未记录。"""
+
+    def _payload(self, nested_dicts):
+        size = int(4.63 * 1024 ** 3)
+        info = dict(success=True, file_count=1, total_size=size,
+                    target_item=dict(size=size, name="把黑夜点燃 (2026) - S01E12 - 第 12 集 - 2160p DoVi.mkv"))
+        meta = dict(episode_list=[12], begin_season=1, begin_episode=12)
+        media = dict(type="电视剧", media_source="themoviedb", media_id="288328", tmdb_id=288328)
+        if not nested_dicts:
+            info = NS(**{**info, "target_item": NS(**info["target_item"])})
+            meta, media = NS(**meta), NS(**media)
+        return {"transferinfo": info, "meta": meta, "mediainfo": media,
+                "fileitem": None, "download_hash": "abc", "downloader": "qb"}
+
+    def _run(self, payload):
+        plugin = make_plugin(_cleanup_enabled=False)
+        plugin.on_transfer_complete(NS(event_data=payload))
+        return plugin
+
+    def test_dict_payload_with_restored_objects(self):
+        plugin = self._run(self._payload(nested_dicts=False))
+        self.assertIn("12", plugin._baselines["themoviedb:288328:1"]["episodes"])
+
+    def test_fully_dict_payload(self):
+        plugin = self._run(self._payload(nested_dicts=True))
+        self.assertIn("12", plugin._baselines["themoviedb:288328:1"]["ep_actual"])
+
+    def test_transfer_marks_from_dict_payload(self):
+        plugin = make_plugin(_cleanup_enabled=True)
+        plugin._safe_cleanup_superseded = lambda: None
+        plugin.on_transfer_complete(NS(event_data=self._payload(nested_dicts=True)))
+        self.assertIn("12", plugin.get_data("transfer_marks")["themoviedb:288328:1"])
+
+
 if __name__ == "__main__":
     unittest.main()

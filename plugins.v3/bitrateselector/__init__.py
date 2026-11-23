@@ -53,7 +53,7 @@ class BitrateSelector(
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.8.0"
+    plugin_version = "1.8.1"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"
@@ -650,12 +650,24 @@ class BitrateSelector(
         if self._enabled and self._wash_enabled and not data.cancel:
             self._record_wash_baseline(data)
 
+    @staticmethod
+    def _as_attr_obj(value: Any) -> Any:
+        """把字典（含嵌套字典）转换为可用 getattr 读取的对象，其他类型原样返回。"""
+        if isinstance(value, dict):
+            from types import SimpleNamespace  # pylint: disable=import-outside-toplevel
+
+            return SimpleNamespace(
+                **{str(k): BitrateSelector._as_attr_obj(v) for k, v in value.items()}
+            )
+        return value
+
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event = None) -> None:
         """整理入库后按实际文件大小记录该集码率基线（覆盖下载前的估算值）。"""
         if not (self._enabled and self._wash_enabled):
             return
-        data = getattr(event, "event_data", None)
+        # V3 的整理完成事件经持久化投递，event_data 是字典而不是对象，统一转成可按属性读取
+        data = self._as_attr_obj(getattr(event, "event_data", None))
         try:
             self._record_transferred_baseline(data)
         except Exception as err:

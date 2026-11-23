@@ -35,7 +35,7 @@ class MPStageFixer(_PluginBase):
         "定时核验 durable 整理待复核任务，仅对目标可证实的步骤自动判定 applied。"
     )
     plugin_icon = ""
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "mpstagefixer_"
     plugin_order = 15
@@ -402,7 +402,19 @@ class MPStageFixer(_PluginBase):
         if not self._enabled or not self._quick_check:
             return
         data = getattr(event, "event_data", None)
-        info = getattr(data, "transferinfo", None) if data is not None else None
+        # V3 的整理完成事件经持久化投递，event_data 是字典，transferinfo 可能也是字典
+        if isinstance(data, dict):
+            info = data.get("transferinfo")
+        else:
+            info = getattr(data, "transferinfo", None) if data is not None else None
+        if isinstance(info, dict):
+            from types import SimpleNamespace  # pylint: disable=import-outside-toplevel
+
+            target = info.get("target_diritem")
+            info = SimpleNamespace(
+                success=info.get("success", False),
+                target_diritem=SimpleNamespace(**target) if isinstance(target, dict) else target,
+            )
         if info is None or not getattr(info, "success", False):
             return
         diritem = getattr(info, "target_diritem", None)
