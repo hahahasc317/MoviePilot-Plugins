@@ -50,7 +50,7 @@ class BitrateSelector(PatchMixin, WashMixin, LibraryMixin, SelectionMixin, Estim
         "并支持每天定时巡检媒体库低码集、自动触发订阅搜索洗版。"
     )
     plugin_icon = ""
-    plugin_version = "1.7.1"
+    plugin_version = "1.7.2"
     plugin_label = "下载管理"
     plugin_author = "hahahasc317"
     plugin_config_prefix = "bitrateselector_"

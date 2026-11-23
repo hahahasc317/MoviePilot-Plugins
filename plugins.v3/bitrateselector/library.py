@@ -258,12 +258,26 @@ class LibraryMixin:
         return sorted(restore), sorted(finished)
 
     @staticmethod
-    def _write_episode_priority(sid: Any, episode_priority: Dict[str, int]) -> None:
-        """在独立短事务中写回订阅分集优先级。"""
+    def _write_episode_priority(sid: Any, changes: Dict[str, int]) -> None:
+        """
+        在独立短事务中把本次改动的分集优先级合并写回订阅。
+
+        只写 changes 里的集：写入前重读订阅最新的分集优先级再合并，
+        避免用插件早先读到的旧快照整表覆盖，冲掉核心在此期间新记下的集
+        （被冲掉的集会在订阅里显示为缺集并被反复搜索）。
+        """
+        if not changes:
+            return
         from app.db.session import SessionFactory  # pylint: disable=import-outside-toplevel
 
         with SessionFactory() as session:
-            SubscribeOper(session).update(int(sid), {"episode_priority": dict(episode_priority)})
+            oper = SubscribeOper(session)
+            current = oper.get(int(sid))
+            if current is None:
+                return
+            merged = dict(subscription_priority.get_episode_priority(current))
+            merged.update({str(k): int(v) for k, v in changes.items()})
+            oper.update(int(sid), {"episode_priority": merged})
             session.commit()
 
     def _restore_expired_demotions(
@@ -284,7 +298,9 @@ class LibraryMixin:
                 for episode in restore:
                     priority_map[str(episode)] = FULL_EPISODE_PRIORITY
                 try:
-                    self._write_episode_priority(sid, priority_map)
+                    self._write_episode_priority(
+                        sid, {str(e): FULL_EPISODE_PRIORITY for e in restore}
+                    )
                 except Exception as err:
                     logger.error(f"码率优选：恢复订阅 {sid} 分集优先级失败：{err}")
                     continue
@@ -415,7 +431,9 @@ class LibraryMixin:
             for episode in graduate:
                 priority_map[str(episode)] = FULL_EPISODE_PRIORITY
             try:
-                self._write_episode_priority(sid, priority_map)
+                self._write_episode_priority(
+                    sid, {str(e): FULL_EPISODE_PRIORITY for e in graduate}
+                )
             except Exception as err:
                 logger.error(f"码率优选：订阅 {sid} 停止洗版写入失败：{err}")
                 continue
@@ -503,7 +521,9 @@ class LibraryMixin:
                 for episode in demote:
                     priority_map[str(episode)] = DEMOTED_EPISODE_PRIORITY
                 try:
-                    self._write_episode_priority(sid, priority_map)
+                    self._write_episode_priority(
+                        sid, {str(e): DEMOTED_EPISODE_PRIORITY for e in demote}
+                    )
                 except Exception as err:
                     logger.error(f"码率优选：低码巡检降级订阅 {sid} 失败：{err}")
                     failed_rows.append(f"· {summary}（降级失败：{err}）")

@@ -694,5 +694,48 @@ class LibraryPresenceTest(unittest.TestCase):
             self.assertEqual(got, {1, 2, 3, 4, 25, 27})
 
 
+class WriteEpisodePriorityMergeTest(unittest.TestCase):
+    """分集优先级写回只合并本次改动的集，不用旧快照覆盖核心新记的集。"""
+
+    def test_merges_into_latest_instead_of_overwriting(self):
+        store = {7: make_subscribe(id=7, episode_priority={"1": 100, "2": 87})}
+        written = {}
+
+        class FakeOper:
+            def __init__(self, session):
+                pass
+
+            def get(self, sid):
+                return store.get(sid)
+
+            def update(self, sid, payload):
+                written[sid] = payload
+
+        class FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def commit(self):
+                pass
+
+        # 插件读快照后，核心又记下了第 3 集
+        store[7].episode_priority = {"1": 100, "2": 87, "3": 95}
+        old_oper = bs_library.SubscribeOper
+        session_mod = _stub("app.db.session", SessionFactory=FakeSession)
+        bs_library.SubscribeOper = FakeOper
+        try:
+            bs_library.LibraryMixin._write_episode_priority(7, {"2": 100})
+        finally:
+            bs_library.SubscribeOper = old_oper
+        self.assertEqual(written[7]["episode_priority"], {"1": 100, "2": 100, "3": 95})
+        self.assertIsNotNone(session_mod)
+
+    def test_empty_changes_skips_write(self):
+        bs_library.LibraryMixin._write_episode_priority(7, {})
+
+
 if __name__ == "__main__":
     unittest.main()
